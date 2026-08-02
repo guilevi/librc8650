@@ -1,0 +1,27 @@
+# Build outputs
+build/
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+*.dSYM/
+rc8650say
+rc8650say.exe
+
+# The NVDA add-on package, and the DLLs `make windows` produces and the
+# packaging step copies in beside the driver.
+nvda/*.nvda-addon
+nvda/synthDrivers/rc8650/*.dll
+
+# The RC8650 firmware image is RC Systems' copyrighted code and must never be
+# committed. It is supplied at runtime -- see the licensing section of README.md.
+*.srec
+*.srec.gz
+
+# Rendered audio: test output, not source.
+*.wav
+*.u8
+
+# macOS
+.DS_Store

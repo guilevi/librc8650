@@ -1,0 +1,954 @@
+--- a/sim/m32c/cpu.h
++++ b/sim/m32c/cpu.h
+@@ -129,6 +129,13 @@
+ {
+   QI bytes;
+   QI mem;
++  /* Set when this operand is an address register (A0/A1) used with a byte
++     size specifier.  The M16C treats that case as 16-bit: "If dest is an A0
++     or A1 when the size specifier (.size) you selected is (.B), src is
++     zero-expanded to perform calculation in 16 bits" (software manual, ADD
++     and friends).  Masking it to 8 bits instead silently discarded the high
++     byte -- see the synthesis page-select bug in notes.md.  */
++  QI areg;
+   HI mask;
+   union
+   {
+--- a/sim/m32c/int.c
++++ b/sim/m32c/int.c
+@@ -42,7 +42,12 @@
+       put_reg (sp, s);
+       mem_put_hi (s, p);
+       mem_put_qi (s + 2, f);
+-      mem_put_qi (s + 3, ((f >> 4) & 0x0f) | (p >> 16));
++      /* M16C interrupt stack: SP+3 is FLG15-12 in the high nibble and
++	 PC19-16 in the low nibble.  The old expression put the PC bank in the
++	 low nibble but OR'd the wrong flag bits into the same nibble, and REIT
++	 then read the bank out of the *high* nibble -- so returning from an
++	 interrupt taken outside bank 0 lost the bank entirely.  */
++      mem_put_qi (s + 3, ((f >> 8) & 0xf0) | ((p >> 16) & 0x0f));
+     }
+   else
+     {
+--- a/sim/m32c/main.c
++++ b/sim/m32c/main.c
+@@ -127,10 +127,30 @@
+ }
+ #endif
+ 
++/* RC8650/RC8660 board support, defined in mem.c.  */
++extern int m32c_baremetal;
++extern int m32c_rc865x;
++extern int m32c_p8_or;
++extern int m32c_rx_ic;
++extern int m32c_tb2_vector;
++extern int m32c_rx_force;
++extern FILE *m32c_dac_file;
++extern unsigned long m32c_pcsample;
++extern unsigned long m32c_statedump;
++extern int m32c_rx_nocts;
++extern int m32c_tx_pc;
++extern int m32c_watch_lo, m32c_watch_hi;
++extern int m32c_rwatch_lo, m32c_rwatch_hi;
++extern int m32c_trace_at;
++extern int m32c_extflash_id, m32c_extflash_armed;
++extern int m32c_cpi;
++extern void update_timer_b2 (void);
++
+ int
+ main (int argc, char **argv)
+ {
+   int o;
++  char *e;
+   int save_trace;
+   bfd *prog;
+ #ifdef HAVE_networking
+@@ -141,6 +161,54 @@
+   setbuf (stdout, 0);
+ 
+   in_gdb = 0;
++
++  if (getenv ("M32C_BAREMETAL"))
++    m32c_baremetal = 1;
++  if (getenv ("M32C_RC865X"))
++    m32c_rc865x = 1;
++  if ((e = getenv ("M32C_P8_OR")) != NULL)
++    m32c_p8_or = strtol (e, NULL, 16);
++  if ((e = getenv ("M32C_RX_IC")) != NULL)
++    m32c_rx_ic = strtol (e, NULL, 16);
++  if ((e = getenv ("M32C_TB2_VECTOR")) != NULL)
++    m32c_tb2_vector = strtol (e, NULL, 0);
++  if (getenv ("M32C_RX_FORCE"))
++    m32c_rx_force = 1;
++  if ((e = getenv ("M32C_PCSAMPLE")) != NULL)
++    m32c_pcsample = strtoul (e, NULL, 0);
++  if ((e = getenv ("M32C_STATEDUMP")) != NULL)
++    m32c_statedump = strtoul (e, NULL, 0);
++  if (getenv ("M32C_RX_NOCTS"))
++    m32c_rx_nocts = 1;
++  if (getenv ("M32C_TX_PC"))
++    m32c_tx_pc = 1;
++  if ((e = getenv ("M32C_WATCH")) != NULL)
++    {
++      char *colon = strchr (e, ':');
++      m32c_watch_lo = strtoul (e, NULL, 16);
++      m32c_watch_hi = colon ? strtoul (colon + 1, NULL, 16) : m32c_watch_lo;
++    }
++  if ((e = getenv ("M32C_RWATCH")) != NULL)
++    {
++      char *colon = strchr (e, ':');
++      m32c_rwatch_lo = strtoul (e, NULL, 16);
++      m32c_rwatch_hi = colon ? strtoul (colon + 1, NULL, 16) : m32c_rwatch_lo;
++    }
++  if ((e = getenv ("M32C_TRACE_AT")) != NULL)
++    m32c_trace_at = strtoul (e, NULL, 16);
++  if ((e = getenv ("M32C_EXTFLASH_ID")) != NULL)
++    m32c_extflash_id = strtoul (e, NULL, 16);
++  if ((e = getenv ("M32C_CPI")) != NULL)
++    m32c_cpi = strtoul (e, NULL, 0);
++  if ((e = getenv ("M32C_DAC_OUT")) != NULL)
++    {
++      m32c_dac_file = fopen (e, "wb");
++      if (!m32c_dac_file)
++	fprintf (stderr, "cannot open M32C_DAC_OUT file %s\n", e);
++      else
++	/* unbuffered, so short captures through a FIFO work */
++	setvbuf (m32c_dac_file, NULL, _IONBF, 0);
++    }
+ 
+   while ((o = getopt_long (argc, argv, "tc:vdm:C", longopts, NULL))
+ 	 != -1)
+@@ -205,6 +273,7 @@
+   trace = 0;
+   m32c_load (prog);
+   trace = save_trace;
++  m32c_extflash_armed = 1;
+ 
+ #ifdef HAVE_networking
+   if (console_port_s)
+@@ -240,5 +309,6 @@
+ #ifdef TIMER_A
+       update_timer_a ();
+ #endif
++      update_timer_b2 ();
+     }
+ }
+--- a/sim/m32c/mem.c
++++ b/sim/m32c/mem.c
+@@ -43,6 +43,167 @@
+ #include "timer_a.h"
+ #endif
+ 
++/* --- RC8650/RC8660 board support (see notes.md) ---------------------------
++   The firmware is bare metal and uses 0x0000e1 and 0x000400-0x000403 as
++   ordinary RAM, but the simulator reserves them as hosted-newlib hooks; 0x403
++   in particular calls abort().  M32C_BAREMETAL turns all five back into plain
++   memory.  M32C_RC865X adds the board's peripherals: UART0, port 8, timer B2
++   and a tap on the D/A converter.  */
++/* Which interrupt-control register is UART0 receive.  IC address = 0x40 +
++   vector number on this part (established from the firmware's own vector
++   table).  Overridable while this is still being pinned down.  */
++/* UART0 receive interrupt: which IC register raises it.  0 = disabled, which
++   is the default -- the firmware reads U0RB only from its receive ISR, but
++   which vector that is has not been identified yet, and guessing wrong derails
++   the run.  Set M32C_RX_IC=<hex> to experiment.  */
++/* UART0 receive lives on vector 18 / IC 0x0052 -- proven: that vector's ISR
++   stores handler 0x04A0, i.e. firmware 0x0A04A0, which is the U0RB read.  */
++int m32c_rx_ic = 0x52;
++/* Timer B2 raises its request flag at 0x0045, which the BIOS delay loop polls,
++   and does NOT vector.  Driving vector 29 from it -- an inherited guess -- made
++   the firmware's main loop run as a priority-7 ISR, which starved everything and
++   spewed status messages.  Real hardware is silent at power-up and simply waits
++   for serial data, which is what this default now reproduces.
++   M32C_TB2_VECTOR=1 restores the old behaviour.  */
++int m32c_tb2_vector = 0;
++int m32c_rx_force = 0;	/* M32C_TB2_VECTOR=0 stops TB2 vectoring to 29 */
++#define RX_IC m32c_rx_ic
++int m32c_baremetal = 0;		/* ignore the hosted hooks at 0xe1, 0x400-0x403 */
++int m32c_rc865x = 0;		/* RC8650/RC8660 board peripheral stubs */
++int m32c_p8_or = 0;		/* value OR'd into reads of port 8 (0x3f0) */
++int m32c_rx_nocts = 0;		/* ignore CTS# (P6_0) when presenting rx bytes */
++int m32c_p6_driven = 0;		/* firmware has written P6 at least once */
++int m32c_tx_pc = 0;		/* log the PC of every U0TB write to stderr */
++
++/* Embedding hooks (librc8650).  When non-NULL these replace the stdio console
++   and the DAC file, so the core can be driven from ring buffers instead of
++   the process's stdin/stdout.  The standalone simulator leaves them NULL and
++   behaves exactly as before.  rx returns 1 for a byte, 0 for "nothing yet",
++   negative for end-of-stream.  */
++int  (*rc865x_hook_rx) (unsigned char *) = NULL;
++void (*rc865x_hook_tx) (unsigned char) = NULL;
++void (*rc865x_hook_dac) (unsigned char) = NULL;
++int m32c_watch_lo = 0, m32c_watch_hi = -1;	/* log writes in [lo,hi] */
++int m32c_rwatch_lo = 0, m32c_rwatch_hi = -1;	/* log reads in [lo,hi] */
++int m32c_trace_at = 0;		/* turn on -t tracing when the PC hits this */
++extern int m32c_disassemble;
++
++/* The external speech/data flash behind the 0x80000 window.  The 6? "chipset
++   identification" reply leads with this chip's JEDEC id: a RAM-resident
++   helper (copied from BIOS flash at 0xFEF2F) writes the autoselect sequence
++   AA->xAAA, 55->x554, 90->xAAA, reads the manufacturer/device id bytes at
++   0x80000/0x80002, then writes F0 (reset to read array).  The hardware
++   owner's board answers 37 0e.  Writes into the flash window are command
++   cycles, not stores -- on real hardware a stray CPU store cannot change
++   flash contents -- so once an image is loaded they no longer modify
++   simulator memory.  M32C_EXTFLASH_ID=<hex4> overrides the id.  */
++int m32c_extflash_id = 0x370e;
++int m32c_extflash_armed = 0;	/* set by main() once the image is loaded */
++int m32c_cpi = 4;		/* timer cycles charged per instruction */
++static int extflash_state = 0, extflash_idmode = 0;
++FILE *m32c_dac_file = NULL;	/* DA0 (0x3d8) write tap */
++unsigned long m32c_pcsample = 0;	/* print the PC every n instructions */
++unsigned long m32c_statedump = 0;	/* dump key RAM every n instructions */
++
++/* Timer B2: the speech sample clock.  TB2MR/TB2 are programmed by both the
++   BIOS and the firmware, TABSR bit 7 starts it, and it drives vector 29.  */
++static struct
++{
++  int count, reload, prescale;
++  unsigned char mode, bsr, ic;
++} timer_b2;
++
++/* The M16C DMA controller.  DMA0: SAR 0x20, DAR 0x24, TCR 0x28, DM0CON 0x2C,
++   request select DM0SL 0x3B8; DMA1 the same shape at 0x30/0x34/0x38/0x3C,
++   DM1SL 0x3BA.  DMxCON: b0 8-bit, b1 repeat, b3 enable, b4 source-forward,
++   b5 dest-forward.  The firmware's speech playback programs DMA0 as
++   SAR=sample ring in RAM (forward), DAR=DA0 (fixed), TCR=0x3FF, con=0x1B,
++   DM0SL=5 -- request source 5 is timer B2, the sample clock (the recording
++   path uses the same trigger with the A/D result as source).  The playback
++   wait loop (RAM 0x1231) polls SAR0 until it catches the fill cursor, so the
++   current source address must be readable back from 0x20.  On repeat-mode
++   counter underflow, TCR and the forward-direction pointer reload from the
++   values latched when the enable bit was set.  */
++static struct
++{
++  unsigned long sar, dar;
++  int tcr;
++} dma_init[2];
++
++static unsigned char *mem_ptr (int address);
++
++static unsigned long
++raw24 (int addr)
++{
++  return *mem_ptr (addr) | (*mem_ptr (addr + 1) << 8)
++    | (*mem_ptr (addr + 2) << 16);
++}
++
++static void
++raw24_put (int addr, unsigned long v)
++{
++  *mem_ptr (addr) = v & 0xff;
++  *mem_ptr (addr + 1) = (v >> 8) & 0xff;
++  *mem_ptr (addr + 2) = (v >> 16) & 0x0f;
++}
++
++static void
++dma_latch (int ch)
++{
++  int base = 0x20 + ch * 0x10;
++  dma_init[ch].sar = raw24 (base);
++  dma_init[ch].dar = raw24 (base + 4);
++  dma_init[ch].tcr = *mem_ptr (base + 8) | (*mem_ptr (base + 9) << 8);
++}
++
++static void
++dma_service (int trigger)
++{
++  int ch;
++  for (ch = 0; ch < 2; ch++)
++    {
++      int base = 0x20 + ch * 0x10;
++      unsigned char con = *mem_ptr (base + 0xc);
++      unsigned char sl = *mem_ptr (ch ? 0x3ba : 0x3b8);
++      unsigned long sar, dar;
++      int tcr, step;
++
++      if (!(con & 0x08) || (sl & 0x0f) != trigger)
++	continue;
++
++      sar = raw24 (base);
++      dar = raw24 (base + 4);
++      tcr = *mem_ptr (base + 8) | (*mem_ptr (base + 9) << 8);
++      step = (con & 0x01) ? 1 : 2;
++
++      mem_put_qi (dar, *mem_ptr (sar & membus_mask));
++      if (step == 2)
++	mem_put_qi (dar + 1, *mem_ptr ((sar + 1) & membus_mask));
++
++      if (con & 0x10)
++	sar += step;
++      if (con & 0x20)
++	dar += step;
++      if (--tcr < 0)
++	{
++	  if (con & 0x02)	/* repeat: reload counter + forward pointer */
++	    {
++	      tcr = dma_init[ch].tcr;
++	      if (con & 0x10)
++		sar = dma_init[ch].sar;
++	      if (con & 0x20)
++		dar = dma_init[ch].dar;
++	    }
++	  else
++	    *mem_ptr (base + 0xc) = con & ~0x08;	/* one-shot: disable */
++	}
++      raw24_put (base, sar);
++      raw24_put (base + 4, dar);
++      *mem_ptr (base + 8) = tcr & 0xff;
++      *mem_ptr (base + 9) = (tcr >> 8) & 0xff;
++    }
++}
++
+ #define L1_BITS  (10)
+ #define L2_BITS  (10)
+ #define OFF_BITS (12)
+@@ -213,15 +374,49 @@
+   m = mem_ptr (address);
+   if (trace)
+     printf (" %02x", value);
++  if (address >= m32c_watch_lo && address <= m32c_watch_hi)
++    fprintf (stderr, "WR %06x = %02x from pc=%06lx\n", address, value,
++	     (unsigned long) regs.r_pc);
++
++  if (m32c_rc865x && (address == 0x2c || address == 0x3c)
++      && (value & 0x08) && !(*m & 0x08))
++    dma_latch (address == 0x2c ? 0 : 1);
++
++  if (m32c_rc865x && m32c_extflash_armed && address >= 0x80000)
++    {
++      if (value == 0xf0)	/* reset to read array */
++	extflash_idmode = extflash_state = 0;
++      else
++	switch (extflash_state)
++	  {
++	  case 0:
++	    if (value == 0xaa && (address & 0xfff) == 0xaaa)
++	      extflash_state = 1;
++	    break;
++	  case 1:
++	    extflash_state =
++	      (value == 0x55 && (address & 0xfff) == 0x554) ? 2 : 0;
++	    break;
++	  case 2:
++	    extflash_state = 0;
++	    if (value == 0x90 && (address & 0xfff) == 0xaaa)
++	      extflash_idmode = 1;
++	    break;
++	  }
++      return;			/* command cycle, never a store */
++    }
++
+   *m = value;
+   switch (address)
+     {
+     case 0x00e1:
++      if (m32c_baremetal)
++	break;
+       {
+ 	static int old_led = -1;
+ 	static char *led_on[] =
+ 	  { "\033[31m O ", "\033[32m O ", "\033[34m O " };
+-	static char *led_off[] = { "\033[0m · ", "\033[0m · ", "\033[0m · " };
++	static char *led_off[] = { "\033[0m ï¿½ ", "\033[0m ï¿½ ", "\033[0m ï¿½ " };
+ 	int i;
+ 	if (old_led != value)
+ 	  {
+@@ -301,21 +496,73 @@
+       break;
+ 
+     case 0x400:
+-      m32c_syscall (value);
++      if (!m32c_baremetal)
++	m32c_syscall (value);
+       break;
+ 
+     case 0x401:
+-      putchar (value);
++      if (!m32c_baremetal)
++	putchar (value);
+       break;
+ 
+     case 0x402:
+-      printf ("SimTrace: %06lx %02x\n", regs.r_pc, value);
++      if (!m32c_baremetal)
++	printf ("SimTrace: %06lx %02x\n", regs.r_pc, value);
+       break;
+ 
+     case 0x403:
+-      printf ("SimTrap: %06lx %02x\n", regs.r_pc, value);
+-      abort ();
++      if (!m32c_baremetal)
++	{
++	  printf ("SimTrap: %06lx %02x\n", regs.r_pc, value);
++	  abort ();
++	}
++      break;
++
++    case 0x3a2:		/* m16c U0TB - UART0 transmit buffer */
++      if (m32c_rc865x)
++	{
++	  if (m32c_tx_pc)
++	    fprintf (stderr, "TX %02x from pc=%06lx\n", value,
++		     (unsigned long) regs.r_pc);
++	  if (rc865x_hook_tx)
++	    rc865x_hook_tx (value);
++	  else if (write (m32c_console_ofd, &value, 1) != 1)
++	    printf ("write console failed: %s\n", strerror (errno));
++	}
++      break;
++
++    case 0x3ec:		/* P6 - bit 0 is the CTS# output */
++      /* The reset value of the RAM cell is 0, which reads as "CTS# low,
++	 ready" before the firmware has configured the port.  Only treat
++	 CTS# as meaningful once the firmware has actually driven P6.  */
++      m32c_p6_driven = 1;
++      break;
++
++    case 0x3d8:		/* DA0 - the speech D/A converter */
++      if (rc865x_hook_dac)
++	rc865x_hook_dac (value);
++      else if (m32c_dac_file)
++	putc (value, m32c_dac_file);
++      break;
++
++    case 0x354:		/* TB2 low */
++      timer_b2.reload = (timer_b2.reload & 0xff00) | value;
++      timer_b2.count = timer_b2.reload;
++      break;
++    case 0x355:		/* TB2 high */
++      timer_b2.reload = (timer_b2.reload & 0x00ff) | (value << 8);
++      timer_b2.count = timer_b2.reload;
++      break;
++    case 0x35d:		/* TB2MR */
++      timer_b2.mode = value;
++      break;
++    case 0x05d:		/* TB2IC */
++      timer_b2.ic = value;
++      break;
+     }
++
++  if (address == 0x340)		/* TABSR - bit 7 is TB2S */
++    timer_b2.bsr = value;
+ }
+ 
+ void
+@@ -330,7 +577,7 @@
+ void
+ mem_put_hi (int address, unsigned short value)
+ {
+-  if (address == 0x402)
++  if (address == 0x402 && !m32c_baremetal)
+     {
+       printf ("SimTrace: %06lx %04x\n", regs.r_pc, value);
+       return;
+@@ -414,12 +661,120 @@
+ }
+ #endif
+ 
++/* stdin_ready() stays true at EOF, which fed the firmware an endless stream
++   of NULs and drove it into its error state.  Read one byte ahead instead and
++   only assert RI when a byte was genuinely received.  */
++static int rx_have = 0, rx_eof = 0;
++static unsigned char rx_byte;
++
++static int
++rc865x_rx_fetch (void)
++{
++  char c;
++  if (rx_have)
++    return 1;
++  if (rc865x_hook_rx)
++    {
++      unsigned char b;
++      int r = rc865x_hook_rx (&b);
++      if (r < 0)
++	rx_eof = 1;
++      if (r <= 0)
++	return 0;
++      rx_byte = b;
++      rx_have = 1;
++      return 1;
++    }
++  if (rx_eof || !stdin_ready ())
++    return 0;
++  if (read (m32c_console_ifd, &c, 1) != 1)
++    {
++      rx_eof = 1;
++      return 0;
++    }
++  rx_byte = c;
++  rx_have = 1;
++  return 1;
++}
++
++/* The RC8650's CTS# pin (datasheet: OUTPUT, "Low when the RC8650 is able to
++   accept data...  CTS# acknowledges each byte received") is P6_0, driven at
++   0x03ec.  The firmware raises it while busy (init, and in the receive wake
++   handler as a per-byte acknowledge) and lowers it when ready for the next
++   byte.  Model a host that honours CTS#: present a byte in U0RB -- and raise
++   RI / the receive request -- only while CTS# is low.  Without this, every
++   queued byte lands during boot, before the firmware arms its receive path,
++   and the "wake on first byte" handler never fires (see notes.md).
++   M32C_RX_NOCTS=1 restores the old fire-hose behaviour.
++
++   Once a byte has been presented (RI shown / request raised) it stays in U0RB
++   until read, regardless of CTS# -- the receive wake handler raises CTS#
++   *before* it reads U0RB.  Presentation is also edge-triggered: the request
++   bit is raised once per byte, not continuously, otherwise the interrupt
++   re-fires between vectoring and the U0RB read and a phantom 0x00 lands in
++   the receive ring.  */
++static int rx_pending = 0;	/* byte presented in U0RB, not yet read */
++
++/* Returns 0: nothing to present; 1: byte already pending; 2: newly arrived */
++static int
++rc865x_rx_present (void)
++{
++  if (rx_pending)
++    return 1;
++  if (!m32c_rx_nocts
++      && (!m32c_p6_driven || (*mem_ptr (0x3ec) & 0x01)))
++    return 0;			/* CTS# high (or undriven): hold the byte */
++  if (!rc865x_rx_fetch ())
++    return 0;
++  rx_pending = 1;
++  return 2;
++}
++
++static int
++rc865x_rx_ready (void)
++{
++  return rc865x_rx_present () != 0;
++}
++
+ static unsigned char
+ mem_get_byte (int address)
+ {
+   unsigned char *m;
+   address &= membus_mask;
+   m = mem_ptr (address);
++
++  if (address >= m32c_rwatch_lo && address <= m32c_rwatch_hi)
++    fprintf (stderr, "RD %06x = %02x from pc=%06lx\n", address, *m,
++	     (unsigned long) regs.r_pc);
++
++  if (m32c_rc865x && extflash_idmode && address >= 0x80000)
++    return (address & 2) ? (m32c_extflash_id & 0xff)
++			 : ((m32c_extflash_id >> 8) & 0xff);
++
++  if (m32c_rc865x)
++    switch (address)
++      {
++      case 0x3a4:		/* U0C0 - bit 3 is TXEPT */
++	return 0x08;
++      case 0x3a5:		/* U0C1 - bit 1 TI, bit 3 RI */
++	return 0x02 | (rc865x_rx_ready () ? 0x08 : 0x00);
++      case 0x3a6:		/* U0RB - UART0 receive buffer */
++	if (rc865x_rx_ready ())
++	  {
++	    rx_have = 0;
++	    rx_pending = 0;
++	    return rx_byte;
++	  }
++	return 0;
++      case 0x3f0:		/* P8 - echo P8.3 onto P8.4 (companion handshake) */
++	{
++	  unsigned char v = *m;
++	  if (v & 0x08)
++	    v |= 0x10;
++	  return v | m32c_p8_or;
++	}
++      }
++
+   switch (address)
+     {
+ #ifdef HAVE_TERMIOS_H
+@@ -618,3 +973,120 @@
+     }
+ }
+ #endif
++
++/* Timer B2 underflow drives vector 29 (TB2IC at 0x005d).  Called once per
++   instruction from the same place as update_timer_a().  Also hosts the PC
++   sampler, which is cheap enough to profile multi-minute untraced runs.  */
++void
++update_timer_b2 (void)
++{
++  if (m32c_pcsample)
++    {
++      static unsigned long n = 0;
++      if (++n >= m32c_pcsample)
++	{
++	  n = 0;
++	  fprintf (stderr, "PC %06lx\n", (unsigned long) regs.r_pc);
++	}
++    }
++
++  if (m32c_trace_at && regs.r_pc == (unsigned) m32c_trace_at)
++    {
++      trace = 1;
++      m32c_disassemble = 1;
++      m32c_trace_at = 0;
++    }
++
++  if (m32c_statedump)
++    {
++      static unsigned long sd = 0;
++      if (++sd >= m32c_statedump)
++	{
++	  int i;
++	  sd = 0;
++	  fprintf (stderr, "STATE pc=%06lx 0400:",
++		   (unsigned long) regs.r_pc);
++	  for (i = 0x400; i < 0x430; i++)
++	    fprintf (stderr, " %02x", mem_get_qi (i));
++	  fprintf (stderr, " 12cc:");
++	  for (i = 0x12cc; i < 0x12e0; i++)
++	    fprintf (stderr, " %02x", mem_get_qi (i));
++	  fprintf (stderr, "\n");
++	}
++    }
++
++  if (!m32c_rc865x)
++    return;
++
++  if (timer_b2.bsr & 0x80)	/* TB2S - counting */
++    {
++      /* The timer counts CPU cycles but the sim used to charge only one per
++	 instruction; a real M16C averages ~4.  Undercounting made the sample
++	 clock ~4x slow relative to code execution, so speech synthesis
++	 lapped the 1024-byte DMA ring and the firmware's produced==played
++	 check (a mod-1024 pointer compare) ended playback a lap early,
++	 truncating utterances.  M32C_CPI overrides.  */
++      timer_b2.prescale -= m32c_cpi;
++      if (timer_b2.prescale < 0)
++	{
++	  timer_b2.prescale += 9;	/* count source f8 (TB2MR TCK = 01) */
++	  timer_b2.count--;
++	  if (timer_b2.count < 0)
++	    {
++	      timer_b2.count = timer_b2.reload;
++	      /* Raise the request; the controller below decides when to take
++		 it.  0x005D is what re-triggers vector 29, whose handler is the
++		 firmware's main loop -- without this the loop runs once and
++		 stops.  Whether TB2 is really vector 29's source is the open
++		 question in notes.md; M32C_TB2_VECTOR=0 disables it.  */
++	      if (m32c_tb2_vector && (timer_b2.ic & 7))
++		*mem_ptr (0x5d) = timer_b2.ic | 0x08;
++	      /* The BIOS delay loop at 0x0fe7f8 starts this timer with TABSR
++		 bit 7 and then polls bit 3 of 0x0045, which nothing in either
++		 image ever writes -- so 0x0045 holds this timer's request
++		 flag, polled without the interrupt being enabled.  (IC address
++		 = 0x40 + vector number is established from the firmware's own
++		 vector-table writes; 0x0045 is vector 5.)  HYPOTHESIS.  */
++	      mem_put_qi (0x45, mem_get_qi (0x45) | 0x08);
++	      /* Timer B2 is DMA request source 5: it paces the sample
++		 stream between RAM and the D/A (playback) or A/D
++		 (recording).  */
++	      dma_service (5);
++	    }
++	}
++    }
++
++  /* UART0 receive.  The firmware only reads U0RB from its receive interrupt
++     handler (0x0A04A0); its polling loop enters below that at 0x0A04A5.  Raise
++     the request and let the controller below decide when to take it.  */
++  if (m32c_rx_ic && rc865x_rx_present () == 2)
++    *mem_ptr (RX_IC) |= 0x08;
++
++  /* The interrupt controller.  Peripherals only ever *set the request bit*; the
++     decision to vector belongs here.  This also covers requests the firmware
++     raises itself -- it writes 0x005D 243 times alternating 0x17/0x1F, i.e. it
++     software-triggers vector 29, and nothing was acting on that.  IC address =
++     0x40 + vector number on this part (see notes.md).  */
++  if (regs.r_flags & FLAGBIT_I)
++    {
++      int a, best = -1, best_pri = (regs.r_flags >> 12) & 0x07;
++      /* Diagnostic: M32C_RX_FORCE=1 lets the receive request ignore the IPL,
++	 to test whether priority is the only thing blocking it.  */
++      if (m32c_rx_force && m32c_rx_ic && (*mem_ptr (m32c_rx_ic) & 0x08))
++	{
++	  trigger_peripheral_interrupt (m32c_rx_ic - 0x40, m32c_rx_ic);
++	  return;
++	}
++      for (a = 0x45; a <= 0x5f; a++)
++	{
++	  unsigned char ic = *mem_ptr (a);
++	  if ((ic & 0x08) && (ic & 0x07) > best_pri)
++	    {
++	      best_pri = ic & 0x07;
++	      best = a;
++	    }
++	}
++      if (best >= 0)
++	trigger_peripheral_interrupt (best - 0x40, best);
++    }
++}
+--- a/sim/m32c/r8c.opc
++++ b/sim/m32c/r8c.opc
+@@ -111,6 +111,17 @@
+   b = get_src (dc);
+ 
+ #define carry (FLAG_C ? 1 : 0)
++
++/* MUL/MULU/DIV/DIVU/DIVX do *not* get the "A0/A1 in .B means a 16-bit
++   operation" treatment that ADD/SUB/AND/OR/XOR/CMP/TST/MOV/ADC/SBB/LDE get:
++   the manual says "If you specified an A0 or A1 for either src or dest,
++   operation is performed on the 8 low-order bits".  Drop the flag for them.  */
++static srcdest
++narrow_areg (srcdest sd)
++{
++  sd.areg = 0;
++  return sd;
++}
+ 
+ static void
+ cmp (int d, int s, int w)
+@@ -145,7 +156,7 @@
+     s = IMM(w);
+   else
+     {
+-      sc = decode_srcdest4 (s, w);
++      sc = narrow_areg (decode_srcdest4 (s, w));
+       s = get_src (sc);
+     }
+ 
+@@ -154,7 +165,10 @@
+   if (!u)
+     {
+       s = sign_ext (s, w ? 16 : 8);
+-      v = sign_ext (v, w ? 16 : 8);
++      /* The dividend is the full R0 for .B and R2R0 for .W (manual: "divides
++	 R2R0 (R0) by signed src").  Sign-extending it from the *divisor's*
++	 width threw away R0H / R2 of every signed division.  */
++      v = sign_ext (v, w ? 32 : 16);
+     }
+ 
+   if (s == 0)
+@@ -850,6 +864,10 @@
+ 
+   NOTYET();
+ 
++  /* LDE sets S and Z from the transferred value (M16C software manual);
++     the RC865x BIOS relies on it -- its flash-id table search ends with
++     "lde.w table[a0],r0 ; jeq done".  */
++
+   /** 0111 010w 1000 dest  LDE.size abs20,dest */
+ 
+   dc = decode_srcdest4 (dest, w);
+@@ -858,6 +876,7 @@
+     v = mem_get_hi (imm);
+   else
+     v = mem_get_qi (imm);
++  set_sz (v, w+1);
+   put_dest (dc, v);
+ 
+   /** 0111 010w 1001 dest  LDE.size dsp:20[a0], dest */
+@@ -868,16 +887,18 @@
+     v = mem_get_hi (imm);
+   else
+     v = mem_get_qi (imm);
++  set_sz (v, w+1);
+   put_dest (dc, v);
+ 
+   /** 0111 010w 1010 dest  LDE.size [a1a0],dest */
+-  
++
+   dc = decode_srcdest4 (dest, w);
+   imm = get_reg (a1a0);
+   if (w)
+     v = mem_get_hi (imm);
+   else
+     v = mem_get_qi (imm);
++  set_sz (v, w+1);
+   put_dest (dc, v);
+ 
+   /** 0111 1101 1010 0imm  LDIPL #IMM */
+@@ -1034,6 +1055,10 @@
+   /** 0111 100w srcx dest  MUL.size src,dest */
+ 
+   BINARY_SOP;
++  sc = narrow_areg (sc);
++  dc = narrow_areg (dc);
++  a = sign_ext (get_src (sc), w?16:8);
++  b = sign_ext (get_src (dc), w?16:8);
+   v = a * b;
+   tprintf("%d * %d = %d\n", a, b, v);
+   dc = widen_sd (dc);
+@@ -1051,6 +1076,10 @@
+   /** 0111 000w srcx dest  MULU.size src,dest */
+ 
+   BINARY_UOP;
++  sc = narrow_areg (sc);
++  dc = narrow_areg (dc);
++  a = get_src (sc);
++  b = get_src (dc);
+   v = a * b;
+   tprintf("%u * %u = %u\n", a, b, v);
+   dc = widen_sd (dc);
+@@ -1258,9 +1287,9 @@
+ 
+   a = get_reg (sp);
+   v = (mem_get_hi (a)
+-       + 4096 * (mem_get_qi (a+3) & 0xf0));
++       + 65536 * (mem_get_qi (a+3) & 0x0f));
+   b = (mem_get_qi (a+2)
+-       + 256 * (mem_get_qi (a+3) & 0xff));
++       + 256 * (mem_get_qi (a+3) & 0xf0));
+   put_reg (pc, v);
+   put_reg (flags, b);
+   put_reg (sp, get_reg (sp) + 4);
+--- a/sim/m32c/srcdest.c
++++ b/sim/m32c/srcdest.c
+@@ -24,7 +24,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-#include "libiberty.h"
+ #include "cpu.h"
+ #include "mem.h"
+ 
+@@ -129,6 +128,8 @@
+ 
+   sd.bytes = bw ? 2 : 1;
+   sd.mem = (destcode >= 6) ? 1 : 0;
++  /* A0/A1 with a .B size specifier: the operation is performed in 16 bits.  */
++  sd.areg = (!bw && (destcode == 0x4 || destcode == 0x5));
+ 
+   if (trace)
+     {
+@@ -209,6 +210,9 @@
+     "disp20[a0]", "disp20[a1]", "disp16[sb]", "abs16"
+   };
+   static const char *dc_anames[4] = { "r0l", "r0h", "r1l", "r1h" };
++  /* The disp20[a0]/disp20[a1] operands below carry a full 20-bit address, so
++     they must not be truncated to the 16-bit width of the address registers.  */
++  int wide = 0;
+ 
+   sd.bytes = w ? 2 : 3;
+   sd.mem = (destcode >= 6) ? 1 : 0;
+@@ -264,9 +268,11 @@
+       break;
+     case 0xc:
+       sd.u.addr = get_reg (a0) + disp20 ();
++      wide = 1;
+       break;
+     case 0xd:
+       sd.u.addr = get_reg (a1) + disp20 ();
++      wide = 1;
+       break;
+     case 0xe:
+       sd.u.addr = get_reg (sb) + disp16 ();
+@@ -278,7 +284,7 @@
+       abort ();
+     }
+   if (sd.mem)
+-    sd.u.addr &= addr_mask;
++    sd.u.addr &= wide ? membus_mask : addr_mask;
+   return sd;
+ }
+ 
+@@ -487,6 +493,7 @@
+   static int regcode[] = { 0, intbl, intbh, flags, isp, sp, sb, fb };
+   srcdest sd;
+   sd.mem = 0;
++  sd.areg = 0;
+   sd.bytes = 2;
+   sd.u.reg = regcode[crcode & 7];
+   return sd;
+@@ -503,6 +510,7 @@
+   };
+   srcdest sd;
+   sd.mem = 0;
++  sd.areg = 0;
+   sd.bytes = bank ? 3 : 2;
+   sd.u.reg = regcode[bank][crcode & 7];
+   return sd;
+@@ -512,6 +520,7 @@
+ widen_sd (srcdest sd)
+ {
+   sd.bytes *= 2;
++  sd.areg = 0;			/* now a genuine 16-bit operand */
+   if (!sd.mem)
+     switch (sd.u.reg)
+       {
+@@ -528,7 +537,11 @@
+ 	sd.u.reg = r3r1;
+ 	break;
+       case a0:
+-	if (A16)
++	/* Only .W widens A0 into the A1A0 pair ("If you selected (.W) ...
++	   If you specified R0, R1, or A0 for dest, the result is stored in
++	   R2R0, R3R1, or A1A0").  A .B multiply's 16-bit result stays in A0
++	   -- widening it here clobbered A1.  */
++	if (A16 && sd.bytes == 4)
+ 	  sd.u.reg = a1a0;
+ 	break;
+       default:
+@@ -543,6 +556,7 @@
+   srcdest rv;
+   rv.bytes = reg_bytes[reg];
+   rv.mem = 0;
++  rv.areg = 0;
+   rv.u.reg = reg;
+   return rv;
+ }
+@@ -574,6 +588,13 @@
+   else
+     {
+       v = get_reg (sd.u.reg);
++      /* A0/A1 with .B: the calculation happens in 16 bits, so the register's
++	 full width is read.  Where the address register is a genuine *source*
++	 rather than the destination, the M16C uses only its 8 low-order bits
++	 -- the arithmetic macros already mask the source by the destination's
++	 width, so that case still comes out right.  */
++      if (sd.areg)
++	return v & 0xffff;
+       switch (sd.bytes)
+ 	{
+ 	case 1:
+@@ -613,6 +634,11 @@
+     }
+   else
+     {
++      if (sd.areg)		/* A0/A1 with .B: 16-bit result, not 8 */
++	{
++	  put_reg (sd.u.reg, v & 0xffff);
++	  return;
++	}
+       switch (sd.bytes)
+ 	{
+ 	case 1:
+@@ -691,7 +717,13 @@
+       addr = get_reg (a1) + disp16 ();
+       break;
+     case 14:
+-      addr = get_reg (sb) + disp16 ();
++      /* Like disp8[sb] above, the SB-relative bit operand is a *bit*
++	 displacement: the effective bit address is SB*8 + disp16.  Adding
++	 SB in byte units sent every "7E xE" bit op to the wrong byte -- the
++	 RC865x firmware's "playback running" flag (btsts 2,0x48[sb] with
++	 SB=0x123E) landed on 0x0290 instead of 0x1286, so its speech
++	 pipeline never throttled and truncated every utterance.  */
++      addr = get_reg (sb) * 8 + disp16 ();
+       break;
+     case 15:
+       addr = disp16 ();
+--- a/sim/m32c/syscalls.c
++++ b/sim/m32c/syscalls.c
+@@ -179,6 +179,15 @@
+   static char buf[256];
+   int rv;
+ 
++  /* Bare-metal firmware: the hosted-newlib syscall trap is a false positive.
++     Set M32C_BAREMETAL=1 to ignore it and keep executing.  */
++  if (getenv ("M32C_BAREMETAL"))
++    {
++      if (trace)
++	printf ("\033[31m/* ignored syscall trap %d */\033[0m\n", id);
++      return;
++    }
++
+   argp = 0;
+   stackp = A16 ? 3 : 4;
+   if (trace)

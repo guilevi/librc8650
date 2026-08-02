@@ -1,0 +1,26 @@
+RC8650 (emulated) - NVDA add-on
+===============================
+
+License: GPL-3.0-or-later.
+
+The driver (__init__.py) is original code. It links librc8650, which wraps the
+Renesas M16C simulator from GDB 14.2 (sim/m32c). That simulator is
+GPL-3.0-or-later, so librc8650 and everything linking it - including
+rc8650_64.dll and rc8650_32.dll shipped beside this file - is
+GPL-3.0-or-later.
+
+NVDA itself is GPL-2.0-or-later. Its license carries an explicit exception
+permitting non-GPL synthesizer drivers, but that is not what is being relied
+on here: GPL-2.0-or-later and GPL-3.0-or-later combine only by distributing
+the result under GPL-3.0-or-later, which is what this add-on does.
+
+  GDB is Copyright (C) the Free Software Foundation.
+  See <https://www.gnu.org/licenses/gpl-3.0.html> for the full license text.
+
+The RC8650 firmware image (rc8650_m4_valid.srec) is RC Systems' copyrighted
+code. It is NOT part of this add-on and is not distributed with it. The driver
+loads it at runtime from a file you supply, and reports the synthesizer as
+unavailable until one is present.
+
+"DoubleTalk", "RC8650" and "RC8660" are RC Systems' marks. This add-on is not
+produced by, endorsed by, or affiliated with RC Systems.

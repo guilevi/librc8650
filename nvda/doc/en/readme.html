@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RC8650 (emulated) — NVDA add-on</title>
+</head>
+<body>
+<h1>RC8650 (emulated)</h1>
+
+<p>An NVDA speech synthesizer that is an RC Systems RC8650 chip. Not a
+recreation of one: the chip's own firmware runs on an emulated Renesas M16C,
+and what you hear is the PCM its D/A converter would have produced. The
+voices, the text-to-speech and the command protocol are all the chip's.</p>
+
+<p>The firmware image is RC Systems' copyrighted code and is not distributed
+with this add-on. Until you place one next to the driver, the synthesizer will
+not appear in NVDA's list. See the add-on's README for where it goes.</p>
+
+<h2>Voices</h2>
+
+<p>Eight, selected with the chip's own Voice command. Each one loads a preset
+inside the firmware, which is what gives it its character.</p>
+
+<table border="1">
+<tr><th>Voice</th><th>Character</th></tr>
+<tr><td>Perfect Paul</td><td>The default: mid pitch, neutral everything.</td></tr>
+<tr><td>Vader</td><td>Very low pitch, lowest formant, some reverb.</td></tr>
+<tr><td>Big Bob</td><td>Low and bassy.</td></tr>
+<tr><td>Precise Pete</td><td>High, treble, crisply articulated, little intonation.</td></tr>
+<tr><td>Ricochet Randy</td><td>Perfect Paul drenched in reverb.</td></tr>
+<tr><td>Biff</td><td>Low formant, bass tone, animated.</td></tr>
+<tr><td>Skip</td><td>Low pitch with the highest formant — small and bright.</td></tr>
+<tr><td>Robo Robert</td><td>Very high pitch, no intonation at all, reverb, and a
+deliberate pause between words.</td></tr>
+</table>
+
+<h2>Settings</h2>
+
+<p>Selecting a voice snaps the settings below it in the list to that voice's
+firmware preset, so what the sliders say is what you hear. Move one and it
+overrides the preset for that voice; leave it alone and the preset comes
+through untouched.</p>
+
+<table border="1">
+<tr><th>Setting</th><th>Chip command</th><th>What it does</th></tr>
+<tr><td>Rate</td><td>nS + nG</td><td>Twenty steps, roughly 116 to 395 words per
+minute. The chip has two ten-step speed scales; this is both of them merged
+into one.</td></tr>
+<tr><td>Pitch</td><td>nP</td><td>The chip's full 0–99 range.</td></tr>
+<tr><td>Inflection</td><td>nE</td><td>How much the pitch moves within a
+sentence. 0 is a monotone; the top is very animated.</td></tr>
+<tr><td>Volume</td><td>nV</td><td>0–9, the chip's own.</td></tr>
+<tr><td>Tone</td><td>nX</td><td>Bass, normal or treble.</td></tr>
+<tr><td>Articulation</td><td>nA</td><td>Low slurs the speech, high makes it
+choppy.</td></tr>
+<tr><td>Formant frequency</td><td>nF</td><td>Shifts the whole vocal tract —
+retunes the voice type rather than its speed.</td></tr>
+<tr><td>Reverb</td><td>nR</td><td>0 is dry; higher values lengthen it.</td></tr>
+<tr><td>Word delay</td><td>nT</td><td>Extra pause between words. The datasheet
+suggests it for listeners new to synthetic speech.</td></tr>
+<tr><td>Punctuation</td><td>nB</td><td>How much punctuation the chip itself
+speaks: all, most, some, or none.</td></tr>
+<tr><td>Read numbers as numbers</td><td>nB</td><td>Off reads 123 as "one two
+three" instead of "one hundred twenty three".</td></tr>
+<tr><td>Speak leading zeros</td><td>nB</td><td>On, "007" keeps its zeros. On a
+screen this is content, so it is on by default even though the chip's own
+default is off.</td></tr>
+<tr><td>Read four-digit numbers as years</td><td>nB</td><td>On, 1492 is
+"fourteen ninety-two".</td></tr>
+<tr><td>Output filter</td><td>—</td><td>Not a chip command: the reconstruction
+filter on the modeled output stage. The RC8650's audio pins are unfiltered, and
+the datasheet's own reference circuit is a 3 kHz low-pass — the default here.
+"Off" is the bare 10 kHz staircase the pins themselves put out.</td></tr>
+</table>
+
+<h2>Known limitations</h2>
+
+<ul>
+<li><strong>Index reporting is accurate to about a tenth of a second.</strong>
+NVDA's index marks are the chip's own index markers: the chip reports each one
+as it reaches that point in the text, and the driver announces the index when
+the audio around it plays. Speech is fed to the sound card in 102 millisecond
+chunks and an index is announced when its chunk has played, so a highlight can
+be up to that late — small enough not to be noticed while reading, but it is
+not sample-exact.</li>
+<li><strong>One instance per NVDA process.</strong> The emulator core keeps
+global state, so only one engine can exist at a time. Switching away and back
+is fine.</li>
+<li><strong>English only.</strong> The chip's Spanish support needs an exception
+dictionary that this driver does not load.</li>
+</ul>
+
+<p>License: GPL-3.0-or-later. See NOTICE.txt beside the driver.</p>
+</body>
+</html>
