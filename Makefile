@@ -56,7 +56,10 @@ LDLIBS  += -lm
 
 CORE    := $(SIM)/mem.c $(SIM)/reg.c $(SIM)/srcdest.c $(SIM)/misc.c \
            $(SIM)/int.c $(GEN)/r8c.c $(GEN)/m32c.c
-LIBSRC  := rc8650.c stubs.c $(CORE)
+# rcdict is BSD-3-Clause and self-contained; linking it in is what makes
+# rc8650_say apply a pronunciation dictionary.
+RCDICTSRC := rcdict/rcdict.c rcdict/rcdict_regex.c
+LIBSRC  := rc8650.c stubs.c $(RCDICTSRC) $(CORE)
 LIBOBJ  := $(addprefix build/,$(notdir $(LIBSRC:.c=.o)))
 
 GENSRC  := $(GEN)/r8c.c $(GEN)/m32c.c
@@ -85,6 +88,14 @@ build/%.o: $(SIM)/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 build/%.o: $(GEN)/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
+build/%.o: rcdict/%.c | build
+	$(CC) $(CFLAGS) -Ircdict -c $< -o $@
+
+# remimu.h is vendored (CC0) and does not compile clean under our warning set;
+# the noise is all in its disabled IF_VERBOSE debug paths. Quiet just this one
+# object so our own code keeps every warning switched on.
+build/rcdict_regex.o: rcdict/rcdict_regex.c rcdict/remimu.h | build
+	$(CC) $(CFLAGS) -w -Ircdict -c $< -o $@
 
 librc8650.a: $(LIBOBJ)
 	$(AR) rcs $@ $^
@@ -94,6 +105,43 @@ $(SHLIB): $(LIBOBJ)
 
 rc8650say: rc8650say.c librc8650.a
 	$(CC) $(CFLAGS) -o $@ rc8650say.c librc8650.a $(LDFLAGS) $(LDLIBS)
+
+# Development bench for the user-dictionary work: speaks text containing raw
+# control bytes and dumps the letter-to-sound stage's own phoneme string.  Not
+# installed, and not built by `all` - it reaches into the simulator core's
+# write-watch, which the library itself does not expose.
+tools/phonlab: tools/phonlab.c librc8650.a
+	$(CC) $(CFLAGS) -o $@ tools/phonlab.c librc8650.a $(LDFLAGS) $(LDLIBS)
+
+# --- rcdict ----------------------------------------------------------------
+#
+# The dictionary layer is BSD-3-Clause and has no dependency on this library or
+# its GPL-3 core, so that doubletalk-pc can link the same sources. Keep it that
+# way: rcdict.c and rcdict_regex.c must build with -Ircdict alone.
+RCDICT := build/rcdict.o build/rcdict_regex.o
+
+# The claim that rcdict can be dropped into doubletalk-pc is only worth
+# anything if it is checked: compile it seeing nothing but its own directory.
+.PHONY: rcdict-standalone
+rcdict-standalone:
+	$(CC) -O2 -std=c99 -pedantic -Wall -Wextra -Ircdict -c rcdict/rcdict.c \
+	      -o /dev/null
+	$(CC) -O2 -std=c99 -w -Ircdict -c rcdict/rcdict_regex.c -o /dev/null
+	@echo "rcdict builds standalone"
+
+.PHONY: rcdict-test
+rcdict/rcdict_test: rcdict/rcdict_test.c rcdict/rcdict.h $(RCDICT)
+	$(CC) $(CFLAGS) -Ircdict -o $@ rcdict/rcdict_test.c $(RCDICT)
+
+# The end-to-end check: renders both sides through the chip and requires the
+# substituted utterance to come back byte-identical to the plain-text one.
+rcdict/rcdict_chiptest: rcdict/rcdict_chiptest.c $(RCDICT) librc8650.a
+	$(CC) $(CFLAGS) -Ircdict -o $@ rcdict/rcdict_chiptest.c $(RCDICT) \
+	      librc8650.a $(LDFLAGS) $(LDLIBS)
+
+rcdict-test: rcdict-standalone rcdict/rcdict_test rcdict/rcdict_chiptest
+	./rcdict/rcdict_test
+	./rcdict/rcdict_chiptest
 
 # --- Windows cross build (mingw-w64) --------------------------------------
 #
@@ -109,7 +157,7 @@ rc8650say: rc8650say.c librc8650.a
 WINCC64 ?= x86_64-w64-mingw32-gcc
 WINCC32 ?= i686-w64-mingw32-gcc
 WINCFLAGS := -O2 -I. -Iwin-compat -include win-compat/rc8650-win.h \
-             -I$(SIM) -I$(GEN) $(WARNOFF)
+             -I$(SIM) -I$(GEN) -Ircdict $(WARNOFF) -Wno-format
 
 .PHONY: windows win64 win32
 windows: win64 win32
@@ -135,4 +183,5 @@ install: all
 
 clean:
 	rm -rf build librc8650.a librc8650.dylib librc8650.so rc8650say \
+	       tools/phonlab rcdict/rcdict_test rcdict/rcdict_chiptest \
 	       rc8650_64.dll rc8650_32.dll

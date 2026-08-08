@@ -8,6 +8,9 @@ build/
 *.dSYM/
 rc8650say
 rc8650say.exe
+tools/phonlab
+rcdict/rcdict_test
+rcdict/rcdict_chiptest
 
 # The NVDA add-on package, and the DLLs `make windows` produces and the
 # packaging step copies in beside the driver.
@@ -25,3 +28,4 @@ nvda/synthDrivers/rc8650/*.dll
 
 # macOS
 .DS_Store
+rcdict/build/
