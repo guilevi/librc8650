@@ -172,6 +172,45 @@ and TS-pin control, and downloadable exception dictionaries and greeting
 messages. None of them have a screen reader's use for them; the commands are
 all still reachable through `librc8650` directly.
 
+## Pronunciation dictionaries
+
+The driver applies `rcdict`, the pronunciation layer described in
+[`../README.md`](../README.md#pronunciation-dictionaries): respellings,
+phonemes through the chip's own phoneme mode, or embedded commands, matched by
+word, substring or regular expression.
+
+**[The dictionary format is documented in `DICTIONARY-GUIDE.md`](../rcdict/DICTIONARY-GUIDE.md)** - a self-contained guide written for users rather than for this repository, and the thing to hand to anyone who asks how to write one.
+
+Dictionaries are `.dict` files in `%APPDATA%\nvda\rc8650\`. They are arranged
+from **NVDA menu → Preferences → Settings → RC8650 dictionaries**, which has a
+list of the files in load order and five buttons:
+
+| Button | Key | What it does |
+|---|---|---|
+| Add… | `Alt+D` | Copies a `.dict` file into the folder |
+| Remove | `Alt+R` | Deletes the selected file from the folder |
+| Move up | `Alt+U` | Raises its priority |
+| Move down | `Alt+N` | Lowers it |
+| Reload dictionaries | `Alt+L` | Re-reads the files, so editing one does not mean restarting the synthesizer |
+
+`Alt+F` moves to the list itself.
+
+**Order is the whole point of the list.** Rules are tried from the top down and
+the first match wins, so a file higher in the list overrides one below it — a
+later file can only *add*. (This is inherited from the chip's own exception
+dictionaries, where the datasheet warns that `(RAT)` placed before `(RATING)`
+means `(RATING)` is never reached.) The order lives in NVDA's configuration,
+not in the filenames.
+
+A `.dict` file dropped into the folder by hand still works: anything the saved
+order has not seen is appended to the end, in sorted order. So the folder alone
+remains a complete way to use this, and the panel is how you take control of
+what beats what.
+
+The order is applied when the Settings dialog is closed with OK or Apply, or
+immediately by the Reload button. Adding and removing files happen at once,
+since they are changes to the folder rather than to a setting.
+
 ## Known limitations
 
 - **Index marks resolve to one audio chunk, not to the sample.** The chip's
@@ -204,12 +243,24 @@ all still reachable through `librc8650` directly.
 
 ## Testing
 
-The driver's logic and its command streams were verified against the real
-emulator outside NVDA: the harness stubs NVDA's API, loads the driver against
-`librc8650.dylib`, speaks, and then asks the chip what its settings actually
-are with the Interrogate command (`12?`) — so every mapping in the table above
-is checked against the chip rather than against the datasheet's prose. The
-voice presets in the driver were read out of the firmware the same way.
+    make -C .. shared      # the tests load librc8650.dylib in place of the DLL
+    tests/run.sh
+
+`tests/` stubs NVDA's API (`nvdastub.py`), stages a copy of the driver package
+with the host's shared library standing in for `rc8650_64.dll`, and drives the
+real `speak()`. It covers the dictionary path: that files are found and loaded
+in the right order, that a substitution reaches the queued bytes, that
+`reloadDictionaries` swaps and detaches cleanly, that **expansion happens before
+`_split`** so no piece can overrun the chip's input buffer, and — the check the
+others rest on — that the chip really renders different audio with a dictionary
+loaded than without. `test_dictfiles.py` covers the load-order rules on their
+own, with no emulator involved.
+
+The rest of the driver's logic and its command streams were verified the same
+way: speak, then ask the chip what its settings actually are with the
+Interrogate command (`12?`) — so every mapping in the table above is checked
+against the chip rather than against the datasheet's prose. The voice presets in
+the driver were read out of the firmware the same way.
 
 The index-marker path was checked the same way, driving the real `speak()` and
 synthesis thread with a stub `WavePlayer` that records what was notified and

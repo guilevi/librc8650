@@ -167,6 +167,27 @@ class _Rc8650DLL:
 		lib.rc8650_sample_rate.argtypes = []
 		lib.rc8650_version.restype = ctypes.c_char_p
 		lib.rc8650_version.argtypes = []
+		# Pronunciation dictionary. rcdict is its own BSD-3 module inside the
+		# DLL, so these are its symbols rather than the library's; only
+		# set_dictionary and expand belong to librc8650.
+		lib.rcdict_new.restype = ctypes.c_void_p
+		lib.rcdict_new.argtypes = [ctypes.c_void_p]
+		lib.rcdict_free.argtypes = [ctypes.c_void_p]
+		lib.rcdict_add_file.restype = ctypes.c_int
+		lib.rcdict_add_file.argtypes = [
+			ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p]
+		lib.rcdict_rule_count.restype = ctypes.c_size_t
+		lib.rcdict_rule_count.argtypes = [ctypes.c_void_p]
+		lib.rc8650_set_dictionary.argtypes = [
+			ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+		lib.rc8650_expand.restype = ctypes.c_size_t
+		lib.rc8650_expand.argtypes = [
+			ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+			ctypes.c_char_p, ctypes.c_size_t]
+		# rcdict_rc8650 is a struct, not a pointer to one, so what is wanted
+		# is its address; in_dll on a pointer type would read its first field.
+		self.rcdict_rc8650 = ctypes.addressof(
+			ctypes.c_char.in_dll(lib, "rcdict_rc8650"))
 
 		# Unload again if the firmware is missing or bad: that is the one
 		# failure every user without an image hits, and it is retried on every
@@ -451,6 +472,9 @@ class SynthDriver(SynthDriver):
 		# the moment the counter moves on. int assignment and comparison are
 		# atomic under the GIL, so no lock is needed to read it.
 		self._generation = 0
+		self._dict = None
+		self._inlinePhonemes = False
+		self._loadDictionaries()
 		self._thread = threading.Thread(target=self._synthLoop, daemon=True)
 		self._thread.start()
 		with self._libLock:
@@ -472,7 +496,85 @@ class SynthDriver(SynthDriver):
 		if not unload:
 			log.warning("Synthesis thread still running; leaving rc8650 DLL loaded")
 		with self._libLock:
+			# The engine borrows the dictionary, so detach before freeing it.
+			if self._dict and unload:
+				try:
+					self._rc.lib.rc8650_set_dictionary(self._rc.handle, None, 0)
+					self._rc.lib.rcdict_free(self._dict)
+				except Exception:
+					log.exception("rc8650: freeing the dictionary failed")
+				self._dict = None
 			self._rc.close(unload=unload)
+
+	# --- pronunciation dictionaries -----------------------------------------
+
+	def _loadDictionaries(self):
+		"""(Re)load the user's rcdict files into the engine.
+
+		Files and load order come from dictfiles; rules are first-match-wins in
+		that order, so the file at the top of the list wins. Format and a worked
+		example: rcdict.h and example.dict.
+
+		Returns (rules, files) for a caller that wants to report what happened.
+		(0, 0) is a perfectly good answer and means the folder is empty; None
+		means the attempt did not get far enough to say. Deliberately quiet
+		either way: a missing folder is the normal case, and every failure path
+		here leaves the synth working exactly as it did before dictionaries
+		existed. A dictionary must never be the reason a screen reader goes
+		quiet.
+		"""
+		try:
+			from . import dictfiles
+			paths = dictfiles.orderedPaths()
+		except Exception:
+			log.exception("rc8650: could not look for dictionaries")
+			return None
+
+		lib = self._rc.lib
+		new = None
+		total = 0
+		if paths or self._inlinePhonemes:
+			try:
+				new = lib.rcdict_new(self._rc.rcdict_rc8650)
+				for path in paths:
+					try:
+						# The library's own char* path, so the ANSI code page -
+						# the same encoding its fopen will decode it with.
+						total += lib.rcdict_add_file(
+							new, path.encode("mbcs"), None, None)
+					except Exception:
+						log.exception("rc8650: could not load %s" % path)
+			except Exception:
+				log.exception("rc8650: building the dictionary failed")
+				new = None
+
+		# Attach the new one before freeing the old, so there is no moment at
+		# which the engine holds a dangling pointer - even though both this and
+		# _expand run on NVDA's main thread and cannot overlap today.
+		old, self._dict = self._dict, new
+		try:
+			with self._libLock:
+				lib.rc8650_set_dictionary(
+					self._rc.handle, new, 1 if self._inlinePhonemes else 0)
+		except Exception:
+			log.exception("rc8650: attaching the dictionary failed")
+		if old:
+			try:
+				lib.rcdict_free(old)
+			except Exception:
+				log.exception("rc8650: freeing the old dictionary failed")
+		if new is not None:
+			log.info("rc8650: loaded %d dictionary rules from %d file(s)"
+				 % (total, len(paths)))
+		return (total, len(paths) if new is not None else 0)
+
+	def reloadDictionaries(self):
+		"""Re-read the dictionary files, for the settings panel.
+
+		This is what makes editing a .dict file a matter of saving it rather
+		than restarting the synthesizer.
+		"""
+		return self._loadDictionaries()
 
 	# --- saved-settings hygiene ---------------------------------------------
 
@@ -829,6 +931,27 @@ class SynthDriver(SynthDriver):
 			return "\x01%dG\x01%dS" % (por | self._STM, speed)
 		return ""
 
+	def _expand(self, text):
+		"""Run the pronunciation dictionary over one utterance's bytes.
+
+		Returns the text unchanged when nothing is loaded, which is the common
+		case, and on any failure - a dictionary must never be the reason a
+		screen reader goes quiet.
+		"""
+		if not self._dict and not self._inlinePhonemes:
+			return text
+		try:
+			lib, h = self._rc.lib, self._rc.handle
+			need = lib.rc8650_expand(h, text, len(text), None, 0)
+			if need <= 0:
+				return text
+			buf = ctypes.create_string_buffer(need + 1)
+			lib.rc8650_expand(h, text, len(text), buf, need + 1)
+			return buf.raw[:need]
+		except Exception:
+			log.exception("rc8650: dictionary expansion failed")
+			return text
+
 	@staticmethod
 	def _split(text):
 		# The chip's input buffer is 2 KB and librc8650's input queue drops
@@ -889,6 +1012,13 @@ class SynthDriver(SynthDriver):
 			elif isinstance(item, (PitchCommand, VolumeCommand, RateCommand)):
 				parts.append(self._prosody(item))
 		text = "".join(parts).encode("ascii", "replace")
+		# EXPAND BEFORE SPLITTING, not after. A dictionary entry can turn one
+		# word into forty characters of phonemes plus the two mode switches, so
+		# a piece that fitted the chip's 2 KB input buffer before expansion may
+		# not afterwards - and librc8650's input ring drops the overflow
+		# without a word. Expanding first means _split measures what is
+		# actually going to be sent.
+		text = self._expand(text)
 		# A split falls on a space (see _split) and a marker command contains
 		# none, so no piece can ever be cut through the middle of one.
 		self._queue.put((self._split(text), marks, self._generation))
