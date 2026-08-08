@@ -135,6 +135,51 @@ from an audio loop. **Markers 66 and 69 do not survive
 `rc8650_set_status_messages()`**: they are `B` and `E`, the V8600-scale
 start/stop messages, which are consumed as status under either speed scale.
 
+### Pronunciation dictionaries
+
+`rcdict/` is a self-contained BSD-3-Clause layer that rewrites text on its way
+to the chip: respellings, phonemes through the chip's own phoneme mode, or
+embedded commands. It is shared byte-for-byte with `doubletalk-pc`, which is
+why it is BSD-3 and depends on nothing but libc — that direction works, the
+reverse never could.
+
+```c
+#include <rcdict.h>
+
+rcdict *d = rcdict_new(&rcdict_rc8650);
+rcdict_add_file(d, "my.dict", NULL, NULL);
+rc8650_set_dictionary(e, d, /* inline [[...]] escapes */ 0);
+rc8650_say(e, "I saw Sean use NVDA.");
+```
+
+Columns are tab-separated:
+
+```
+word		Sean	Shon
+word		NVDA	[EH N V IY D IY EY]
+word	C	US	[Y UW EH S]
+regex		\bv([0-9]+)\.([0-9]+)\b	version \1 point \2
+```
+
+`rcdict/example.dict` is a worked example, and the test suite requires it to
+parse without a diagnostic. Full format in `rcdict/rcdict.h`.
+
+**A caller that splits long text into utterances must expand first**, with
+`rc8650_expand()` — one word can become forty characters of phonemes plus the
+mode switches, so splitting before expanding can push a piece past the chip's
+2 KB input buffer, where the overflow is dropped silently.
+
+The substitutions are shaped by measurement, not guesswork: a phoneme span
+breaks the letter-to-sound stage's context on both sides of itself, so trailing
+`.`/`,` is moved inside the span and a preceding article `a` is absorbed into
+it. With both applied the audio is byte-identical to what text mode produces.
+See `dict-lab/RESULTS.md`, and `make rcdict-test`, which checks that on the
+chip and not just on paper.
+
+Regex support is Remimu (CC0, vendored as `rcdict/remimu.h`), with its
+backtracking budget capped — a runaway pattern is retired for the rest of the
+utterance and reported, rather than being allowed to stall synthesis.
+
 ### The output stage
 
 The 8-bit path is the bare D/A. The s16 path adds the output stage a finished

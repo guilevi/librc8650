@@ -15,8 +15,19 @@
 #include <unistd.h>
 
 #include "rc8650.h"
+#include "rcdict/rcdict.h"
 
 #define DEFAULT_FIRMWARE "rc8650_m4_valid.srec"
+
+/* A dictionary is a file the user edits, so say what is wrong with it rather
+   than quietly dropping the line. */
+static void
+dict_complain (void *ctx, size_t off, const char *msg)
+{
+  (void) ctx;
+  (void) off;
+  fprintf (stderr, "rc8650say: %s\n", msg);
+}
 
 static void
 usage (FILE *f)
@@ -29,6 +40,8 @@ usage (FILE *f)
 	   "  -f FILE      firmware S-record (default: %s,\n"
 	   "               or $RC8650_FIRMWARE)\n"
 	   "  -c CMD       send <CTRL+A>CMD<CR> before speaking, e.g. -c 5S\n"
+	   "  -d FILE      load a pronunciation dictionary (repeatable)\n"
+	   "  --phonemes   allow [[K AE T]] phoneme escapes in the text\n"
 	   "  --chip-id    print the 6? chipset identification and exit\n"
 	   "  -q           quiet: no progress on stderr\n"
 	   "  -h, --help   this message\n"
@@ -144,6 +157,9 @@ int
 main (int argc, char **argv)
 {
   const char *out_path = NULL, *fw = NULL, *precmd = NULL;
+  const char *dicts[8];
+  int ndicts = 0, inline_phonemes = 0;
+  rcdict *dict = NULL;
   int raw = 0, chip_id = 0, quiet = 0;
   char text[8192];
   size_t textlen = 0;
@@ -170,6 +186,15 @@ main (int argc, char **argv)
 	fw = argv[++i];
       else if (!strcmp (argv[i], "-c") && i + 1 < argc)
 	precmd = argv[++i];
+      else if (!strcmp (argv[i], "-d") && i + 1 < argc)
+	{
+	  if (ndicts < (int) (sizeof dicts / sizeof dicts[0]))
+	    dicts[ndicts++] = argv[++i];
+	  else
+	    i++;
+	}
+      else if (!strcmp (argv[i], "--phonemes"))
+	inline_phonemes = 1;
       else if (!strcmp (argv[i], "--raw"))
 	raw = 1;
       else if (!strcmp (argv[i], "--chip-id"))
@@ -275,6 +300,14 @@ main (int argc, char **argv)
   if (!raw)
     wav_header (out, 0);	/* patched below */
 
+  if (ndicts || inline_phonemes)
+    {
+      dict = rcdict_new (&rcdict_rc8650);
+      for (i = 0; i < ndicts; i++)
+	rcdict_add_file (dict, dicts[i], dict_complain, NULL);
+      rc8650_set_dictionary (e, dict, inline_phonemes);
+    }
+
   if (precmd)
     rc8650_command (e, precmd);
   rc8650_say (e, text);
@@ -306,6 +339,7 @@ main (int argc, char **argv)
 	     (double) total / RC8650_SAMPLE_RATE, total, RC8650_SAMPLE_RATE);
 
   rc8650_free (e);
+  rcdict_free (dict);
 
   if (playing)
     {

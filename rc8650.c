@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "rc8650.h"
+#include "rcdict/rcdict.h"
 #include "cpu.h"
 #include "mem.h"
 
@@ -152,6 +153,8 @@ struct rc8650
   int talking;			/* a start message has arrived, no stop yet */
   int audio_pump;		/* inside rc8650_read, so tx bytes are status */
   int index_marks;		/* caller wants nI markers captured */
+
+  rcdict_options dict;		/* pronunciation rules; profile always set */
 
   unsigned char *image;		/* decoded firmware, kept for reset */
   size_t image_len;
@@ -683,6 +686,7 @@ rc8650_new_from_memory (const void *srec, size_t len, char **err)
   memcpy (e->image_srec, srec, len);
   e->image_srec_len = len;
   biquad_design (e, RC8650_DEFAULT_LOWPASS_HZ);
+  rcdict_options_init (&e->dict, &rcdict_rc8650);
 
   the_engine = e;
   rc865x_hook_rx = hook_rx;
@@ -786,13 +790,64 @@ rc8650_write (rc8650_t *e, const void *data, size_t len)
   e->thinking = 0;
 }
 
+/* --- pronunciation dictionary ---------------------------------------------
+ *
+ * The rules live in rcdict/, which knows nothing about this library; all that
+ * happens here is that rc8650_say runs its text through them.  See rcdict.h
+ * for the file format, and dict-lab/RESULTS.md for why the substitutions are
+ * shaped the way they are.
+ */
+
+void
+rc8650_set_dictionary (rc8650_t *e, const rcdict *d, int inline_phonemes)
+{
+  if (!e)
+    return;
+  e->dict.dict = d;		/* borrowed: the caller keeps ownership */
+  e->dict.inline_phonemes = inline_phonemes ? 1 : 0;
+}
+
+size_t
+rc8650_expand (rc8650_t *e, const char *in, size_t inlen,
+	       char *out, size_t outcap)
+{
+  if (!e || !in)
+    return 0;
+  return rcdict_expand (&e->dict, in, inlen, out, outcap, NULL, NULL);
+}
+
 void
 rc8650_say (rc8650_t *e, const char *text)
 {
+  size_t len, need;
+  char stackbuf[1024], *buf = NULL;
+
   if (!e || !text)
     return;
-  rc8650_write (e, text, strlen (text));
-  rc8650_write (e, "\r", 1);	/* nothing is spoken until CR or NUL */
+  len = strlen (text);
+
+  /* No dictionary and no escape means nothing to do, which is the common
+     case and stays allocation-free. */
+  if (!e->dict.dict && !e->dict.inline_phonemes)
+    {
+      rc8650_write (e, text, len);
+      rc8650_write (e, "\r", 1);	/* nothing is spoken until CR or NUL */
+      return;
+    }
+
+  need = rcdict_expand (&e->dict, text, len, NULL, 0, NULL, NULL);
+  buf = (need < sizeof stackbuf) ? stackbuf : malloc (need + 1);
+  if (!buf)
+    {				/* speak it unexpanded rather than not at all */
+      rc8650_write (e, text, len);
+      rc8650_write (e, "\r", 1);
+      return;
+    }
+  rcdict_expand (&e->dict, text, len, buf, need + 1, NULL, NULL);
+  rc8650_write (e, buf, need);
+  rc8650_write (e, "\r", 1);
+  if (buf != stackbuf)
+    free (buf);
 }
 
 void

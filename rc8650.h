@@ -71,8 +71,35 @@ void rc8650_reset (rc8650_t *e);
 void rc8650_write (rc8650_t *e, const void *data, size_t len);
 
 /* Queue text and terminate it with CR so the chip starts speaking.  Embedded
- * command sequences are passed through untouched. */
+ * command sequences are passed through untouched, and the pronunciation
+ * dictionary (if one is set) is applied first. */
 void rc8650_say (rc8650_t *e, const char *text);
+
+/* --- pronunciation dictionary -------------------------------------------- */
+
+/* Substitute pronunciations into text on its way to the chip: respellings,
+ * phonemes through the chip's own phoneme mode, or embedded commands.  The
+ * rules, the file format and the loaders are rcdict's; include rcdict.h to
+ * build one.  Everything here is optional and off until asked for.
+ *
+ * The dictionary is BORROWED.  It must outlive the engine, or be replaced with
+ * NULL before it is freed.  inline_phonemes switches on the "[[K AE T]]"
+ * escape in ordinary text, which is off by default because "[[" is wiki link
+ * syntax and a user reading a wiki must not lose text to it. */
+typedef struct rcdict rcdict;
+void rc8650_set_dictionary (rc8650_t *e, const rcdict *d, int inline_phonemes);
+
+/* Run the dictionary over text WITHOUT speaking it, returning the number of
+ * bytes the result needs (not counting a terminating NUL), so a return value
+ * >= outcap means it was truncated and the call should be repeated bigger.
+ *
+ * This exists for callers that split long text into utterances themselves: a
+ * word can expand to forty characters of phonemes plus the mode switches, so
+ * splitting first and expanding after can push a piece past the chip's 2 KB
+ * input buffer, where the overflow is dropped without a word.  Expand, then
+ * split. */
+size_t rc8650_expand (rc8650_t *e, const char *in, size_t inlen,
+		      char *out, size_t outcap);
 
 /* Send a command such as "6?" or "5S" as <CTRL+A>cmd<CR>. */
 void rc8650_command (rc8650_t *e, const char *cmd);
