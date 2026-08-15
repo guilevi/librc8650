@@ -218,6 +218,85 @@ main (int argc, char **argv)
     rcdict_free (dict);
   }
 
+  /* And once more through the exception-rule matcher, one letter at a time.
+     This is the check the coalescing exists for: eight separate rules fire and
+     must produce ONE phoneme span, because eight of them would be eight pairs
+     of mode switches and would not sound like the word at all.  Spelling
+     "computer" out letter by letter into the pronunciation the chip picks for
+     itself means byte-identical audio is again the standard. */
+  {
+    static const char *const src =
+      "rule\t\t(c)\t[K]\n"
+      "rule\t\t(o)\t[AX]\n"
+      "rule\t\t(m)\t[M]\n"
+      "rule\t\t(p)\t[P]\n"
+      "rule\t\t(u)\t[YY UW]\n"
+      "rule\t\t(t)\t[DX]\n" "rule\t\t(e)\t\n" "rule\t\t(r)\t[ER]\n";
+    /* The bare word is the third known-lossy adjacency, alongside '?' above:
+       a span that runs to the very end of an utterance with no punctuation
+       after it loses the closing stress code (5d 32) the text path emits.
+       It is nothing to do with the rules or with coalescing -- a plain
+       "[[K AX M P YY UW DX ER]]" drops it too -- and it is asserted here so
+       that it is noticed if it ever stops being true. */
+    static const struct
+    {
+      const char *text;
+      int identical;
+    } cases[] = {
+      {
+      "computer", 0},
+      {
+      "computer.", 1}
+    };
+    rcdict_options dopt;
+
+    dict = rcdict_new (&rcdict_rc8650);
+    nerr = 0;
+    rcdict_add_text (dict, src, strlen (src), "letters", complain, &nerr);
+    rcdict_options_init (&dopt, &rcdict_rc8650);
+    dopt.dict = dict;
+
+    for (k = 0; k < sizeof cases / sizeof cases[0]; k++)
+      {
+	char expanded[1024];
+	unsigned long ns = 0, nr = 0;
+	unsigned long long hs, hr;
+	int same, nspans = 0;
+	const char *q;
+
+	rcdict_expand (&dopt, cases[k].text, strlen (cases[k].text), expanded,
+		       sizeof expanded, NULL, NULL);
+
+	/* Eight rules fired; there must be exactly one span.  Checked here
+	   and not only by ear, because eight spans would still say roughly
+	   the right thing and would be easy to miss. */
+	for (q = expanded; (q = strstr (q, "\x01" "D")) != NULL; q += 2)
+	  nspans++;
+	if (nspans != 1)
+	  {
+	    failures++;
+	    printf ("FAIL letter-by-letter rules: \"%s\" made %d spans, "
+		    "want 1: %s\n", cases[k].text, nspans, expanded);
+	  }
+
+	hs = render (e, expanded, &ns);
+	hr = render (e, cases[k].text, &nr);
+	same = (hs == hr && ns == nr);
+
+	if (same != cases[k].identical)
+	  {
+	    failures++;
+	    printf ("FAIL letter-by-letter rules: \"%s\"\n", cases[k].text);
+	    printf ("       expanded to %s\n", expanded);
+	  }
+	else
+	  printf ("ok   letter-by-letter rules: \"%s\"%s\n", cases[k].text,
+		  cases[k].identical ? "" : " (expected to differ)");
+	printf ("       %lu samples both ways\n", ns);
+      }
+    rcdict_free (dict);
+  }
+
   rc8650_free (e);
   printf ("%d failures\n", failures);
   return failures != 0;
