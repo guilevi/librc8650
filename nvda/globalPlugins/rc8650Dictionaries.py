@@ -24,13 +24,20 @@
 # way you want. Hence a list with Move up / Move down, and hence the order
 # living in NVDA's configuration rather than in the filenames.
 #
+# Add does not copy. It records where the file is and leaves it there, so the
+# file the user edits is the file the synthesizer reads - press Reload and the
+# edit is live. Copying would have made every dictionary two files, one of them
+# quietly stale, and "why did my change do nothing" the commonest question about
+# this panel. Remove is the mirror of that: a reference is dropped from the
+# list, and only a file in the add-on's own folder is deleted, because that
+# folder is scanned and unlisting a file in it would not stick.
+#
 # Everything here is keyboard-first: the buttons keep the focus when they act
 # (so Move up can be pressed four times without chasing the selection around),
 # and anything that happens without focus moving is spoken with ui.message,
 # because a wx selection changed in code raises no event for NVDA to announce.
 
 import os
-import shutil
 
 import wx
 
@@ -73,7 +80,8 @@ class DictionariesPanel(SettingsPanel):
 		"Pronunciation dictionaries for the RC8650 (emulated) "
 		"synthesizer. Rules are tried from the top of the list downwards and "
 		"the first match wins, so a file higher in the list overrides one "
-		"below it."
+		"below it. Files are read where they are, so you can edit one and "
+		"press Reload dictionaries."
 	)
 
 	def makeSettings(self, settingsSizer):
@@ -85,14 +93,16 @@ class DictionariesPanel(SettingsPanel):
 			wx.StaticText(self, label=self.panelDescription))
 		description.Wrap(self.scaleSize(PANEL_DESCRIPTION_WIDTH))
 
-		#: The working order. Held here rather than read back out of the list
-		#: control so that a move is a list operation and not a screen-scrape.
-		self._names = dictfiles.orderedNames()
+		#: The working order, as dictfiles entries. Held here rather than read
+		#: back out of the list control so that a move is a list operation and
+		#: not a screen-scrape - and because what the list SHOWS is a label,
+		#: which is not what goes in the configuration.
+		self._entries = dictfiles.orderedEntries()
 
 		self._listBox = sHelper.addLabeledControl(
 			"Dictionary &files, in the order they are loaded",
 			wx.ListBox,
-			choices=self._names,
+			choices=self._labels(),
 		)
 		self._listBox.Bind(wx.EVT_LISTBOX, self.onSelectionChanged)
 
@@ -112,9 +122,13 @@ class DictionariesPanel(SettingsPanel):
 		self._downButton.Bind(wx.EVT_BUTTON, lambda evt: self._move(1))
 		self._reloadButton.Bind(wx.EVT_BUTTON, self.onReload)
 
+		# Add can reach a file anywhere, so this is no longer where dictionaries
+		# have to live - but it is still scanned, and it is still the answer for
+		# someone who just wants somewhere to put one.
 		sHelper.addItem(wx.StaticText(
 			self,
-			label="Dictionary files are kept in: %s" % dictfiles.folderPath(),
+			label="Files added here stay where they are. Anything placed in "
+				"%s is loaded as well." % dictfiles.folderPath(),
 		))
 
 		self._selectIndex(0)
@@ -124,25 +138,45 @@ class DictionariesPanel(SettingsPanel):
 		# in by hand, or an editor saving a new one - and the panel may well
 		# have been built at the start of the session. Re-merge rather than
 		# reload, so an order the user has arranged but not yet applied is not
-		# thrown away by walking out of the category and back in.
+		# thrown away by walking out of the category and back in. It also
+		# refreshes the "not found" marks, which is the other thing that can
+		# change under a panel left open.
 		#
-		# The selection is restored by NAME rather than by index, because the
+		# The selection is restored by ENTRY rather than by index, because the
 		# merge can insert above it.
 		index = self._listBox.GetSelection()
-		current = self._names[index] if 0 <= index < len(self._names) else None
-		self._names = dictfiles.mergeOrder(self._names)
-		self._rebuild(self._names.index(current) if current in self._names else 0)
+		current = self._entries[index] \
+			if 0 <= index < len(self._entries) else None
+		self._entries = dictfiles.mergeOrder(self._entries)
+		self._rebuild(
+			self._entries.index(current) if current in self._entries else 0)
 		super(DictionariesPanel, self).onPanelActivated()
 
 	# --- the list -------------------------------------------------------------
 
+	def _labels(self):
+		return [dictfiles.label(e) for e in self._entries]
+
+	def _find(self, entry):
+		"""Where C{entry} is in the working list, or -1.
+
+		Same file, not same spelling, and dictfiles is the one that decides
+		which is which - the panel must not grow a second opinion about it.
+		"""
+		wanted = dictfiles.key(dictfiles.normalize(entry))
+		keys = [dictfiles.key(e) for e in self._entries]
+		try:
+			return keys.index(wanted)
+		except ValueError:
+			return -1
+
 	def _rebuild(self, select=0):
-		self._listBox.Set(self._names)
+		self._listBox.Set(self._labels())
 		self._selectIndex(select)
 
 	def _selectIndex(self, index):
-		if self._names:
-			index = max(0, min(index, len(self._names) - 1))
+		if self._entries:
+			index = max(0, min(index, len(self._entries) - 1))
 			self._listBox.SetSelection(index)
 		self._updateButtons()
 
@@ -151,7 +185,7 @@ class DictionariesPanel(SettingsPanel):
 		has = index != wx.NOT_FOUND
 		self._removeButton.Enable(has)
 		self._upButton.Enable(has and index > 0)
-		self._downButton.Enable(has and index < len(self._names) - 1)
+		self._downButton.Enable(has and index < len(self._entries) - 1)
 
 	def onSelectionChanged(self, evt):
 		self._updateButtons()
@@ -161,22 +195,32 @@ class DictionariesPanel(SettingsPanel):
 		if index == wx.NOT_FOUND:
 			return
 		target = index + delta
-		if target < 0 or target >= len(self._names):
+		if target < 0 or target >= len(self._entries):
 			return
-		self._names[index], self._names[target] = \
-			self._names[target], self._names[index]
+		self._entries[index], self._entries[target] = \
+			self._entries[target], self._entries[index]
 		self._rebuild(target)
 		# Focus stays on the button so the move can be repeated, which means
 		# nothing announces the new position by itself.
 		ui.message("%s, %d of %d"
-			% (self._names[target], target + 1, len(self._names)))
+			% (dictfiles.label(self._entries[target]),
+				target + 1, len(self._entries)))
 
 	# --- adding and removing --------------------------------------------------
 
 	def onAdd(self, evt):
+		"""Point the list at files, wherever they are. Nothing is copied.
+
+		The dialog opens in the dictionary folder when there is one, because
+		that is where a user with no opinion about where to keep dictionaries
+		will have put them - but it is only a starting point, and anywhere is
+		as good.
+		"""
 		with wx.FileDialog(
 			self,
 			message="Select pronunciation dictionaries to add",
+			defaultDir=dictfiles.folderPath()
+				if os.path.isdir(dictfiles.folderPath()) else "",
 			wildcard="Pronunciation dictionaries (*%s)|*%s|All files (*.*)|*.*"
 				% (dictfiles.EXTENSION, dictfiles.EXTENSION),
 			style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
@@ -186,95 +230,76 @@ class DictionariesPanel(SettingsPanel):
 			chosen = dialog.GetPaths()
 
 		added = []
+		already = []
 		for source in chosen:
-			name = self._install(source)
-			if name and name.lower() not in [n.lower() for n in self._names]:
-				self._names.append(name)
-				added.append(name)
-			elif name:
-				# Already in the list: replacing the file on disk is the whole
-				# of the change, and its place in the order is left alone.
-				added.append(name)
-		if not added:
-			return
-		index = [n.lower() for n in self._names].index(added[-1].lower())
-		self._rebuild(index)
-		ui.message("Added %s" % _count(len(added), "dictionary", "dictionaries"))
+			entry = dictfiles.normalize(source)
+			if not entry:
+				continue
+			if self._find(entry) != -1:
+				# Already listed, under whatever spelling. Adding it again would
+				# be a second entry for one file, and the second could never
+				# match anything the first had not already matched.
+				already.append(entry)
+				continue
+			self._entries.append(entry)
+			added.append(entry)
 
-	def _install(self, source):
-		"""Copy one file into the dictionary folder. Returns its name, or None.
-
-		Copied rather than referenced where it lies, so that the folder is the
-		whole answer to "which dictionaries do I have" - and so that a
-		dictionary handed over on a memory stick still works next week. The
-		copy is the one to edit afterwards.
-		"""
-		try:
-			folder = dictfiles.folderPath(create=True)
-		except OSError:
-			log.exception("rc8650: could not create the dictionary folder")
-			gui.messageBox(
-				"Could not create the dictionary folder %s."
-					% dictfiles.folderPath(),
-				"Error", wx.OK | wx.ICON_ERROR, self)
-			return None
-
-		name = os.path.basename(source)
-		destination = os.path.join(folder, name)
-		if os.path.normcase(os.path.abspath(source)) == \
-				os.path.normcase(os.path.abspath(destination)):
-			# Adding a file that is already installed. Not an error, and not a
-			# copy either - copying a file onto itself truncates it.
-			return name
-		if os.path.exists(destination) and gui.messageBox(
-			"%s is already in the dictionary folder. Replace it?" % name,
-			"Replace dictionary",
-			wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING, self,
-		) != wx.YES:
-			return None
-		try:
-			shutil.copyfile(source, destination)
-		except (OSError, shutil.Error):
-			log.exception("rc8650: could not copy %s" % source)
-			gui.messageBox("Could not copy %s into the dictionary folder." % name,
-				"Error", wx.OK | wx.ICON_ERROR, self)
-			return None
-		return name
+		if added:
+			self._rebuild(self._find(added[-1]))
+			ui.message("Added %s"
+				% _count(len(added), "dictionary", "dictionaries"))
+		elif already:
+			index = self._find(already[-1])
+			self._rebuild(index)
+			ui.message("%s is already in the list"
+				% dictfiles.label(self._entries[index]))
 
 	def onRemove(self, evt):
+		"""Take the selected dictionary out of the list.
+
+		For a file in the add-on's own folder that means deleting it, and there
+		is no way round that: the folder is scanned for anything the saved order
+		has not seen, so a file merely dropped from the list would be picked
+		straight back up. For a file anywhere else it means exactly what it
+		says, and nothing on disk is touched - which is why only the first case
+		asks.
+		"""
 		index = self._listBox.GetSelection()
 		if index == wx.NOT_FOUND:
 			return
-		name = self._names[index]
-		# Deleting is what removal has to mean here: the folder is scanned for
-		# anything the saved order has not seen, so a file merely dropped from
-		# the list would be picked straight back up. Said plainly rather than
-		# hidden, which is why this confirmation names the folder.
-		if gui.messageBox(
-			"Remove %s?\n\nThe file will be deleted from %s." % (name, dictfiles.folderPath()),
-			"Remove dictionary",
-			wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING, self,
-		) != wx.YES:
-			return
-		try:
-			os.remove(os.path.join(dictfiles.folderPath(), name))
-		except OSError:
-			log.exception("rc8650: could not delete %s" % name)
-			gui.messageBox("Could not delete %s." % name,
-				"Error", wx.OK | wx.ICON_ERROR, self)
-			return
-		del self._names[index]
+		entry = self._entries[index]
+		name = dictfiles.label(entry)
+		if dictfiles.inFolder(entry):
+			if gui.messageBox(
+				"Remove %s?\n\nThe file will be deleted from %s."
+					% (entry, dictfiles.folderPath()),
+				"Remove dictionary",
+				wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING, self,
+			) != wx.YES:
+				return
+			try:
+				os.remove(dictfiles.fullPath(entry))
+			except OSError:
+				log.exception("rc8650: could not delete %s" % entry)
+				gui.messageBox("Could not delete %s." % entry,
+					"Error", wx.OK | wx.ICON_ERROR, self)
+				return
+		del self._entries[index]
 		self._rebuild(index)
 		ui.message("Removed %s" % name)
 
 	# --- applying -------------------------------------------------------------
 
 	def onSave(self):
-		dictfiles.setOrder(self._names)
+		dictfiles.setOrder(self._entries)
 		self._reloadSynth()
 
 	def onReload(self, evt):
 		"""Re-read the files, so editing one does not mean restarting the synth.
+
+		This is the button the whole no-copying arrangement is for: the file the
+		user just saved in their editor is the file the synthesizer reads, so
+		re-reading it is the entire round trip.
 
 		The folder is re-scanned first, so this also picks up a file written
 		since the panel was opened; and the order is saved first, because a user
@@ -282,9 +307,9 @@ class DictionariesPanel(SettingsPanel):
 		that takes effect, and applying a different order from the one shown
 		would be the worst of both.
 		"""
-		self._names = dictfiles.mergeOrder(self._names)
+		self._entries = dictfiles.mergeOrder(self._entries)
 		self._rebuild(self._listBox.GetSelection())
-		dictfiles.setOrder(self._names)
+		dictfiles.setOrder(self._entries)
 		result = self._reloadSynth()
 		if result is None:
 			ui.message(

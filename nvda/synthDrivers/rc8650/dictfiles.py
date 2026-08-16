@@ -14,13 +14,31 @@
 # here rather than with the panel because the driver has to work whether or not
 # the panel ever loads - never the other way round.
 #
-# The rule in one sentence: the dictionaries are the .dict files in
-# <nvda config>/rc8650/, loaded in the order stored in NVDA's configuration,
-# with anything that order has not seen yet appended in sorted order.
+# The rule in one sentence: the dictionaries are the files listed in NVDA's
+# configuration, in that order, wherever on disk they live, plus every .dict
+# file in <nvda config>/rc8650/ that the list has not already named, appended in
+# sorted order.
 #
-# That last clause is what keeps dropping a file into the folder working. It is
-# how dictionaries worked before there was a panel, and it is how a user who
-# never opens the panel goes on using them.
+# Two sources, because they answer two different questions. The folder is the
+# zero-configuration one: drop a file in and it works, which is how dictionaries
+# worked before there was a panel and how a user who never opens the panel goes
+# on using them. The list is for files kept ANYWHERE ELSE - a dictionary in a
+# Dropbox folder, one under version control, one being edited in a text editor
+# two windows away. Those are REFERENCED WHERE THEY LIE, never copied here: a
+# copy is a second file that goes stale the moment the first is edited, and the
+# whole point of the reload button is that editing a dictionary is a matter of
+# saving it.
+#
+# So an entry is one of two things, and which one it is is decided by whether it
+# has a directory part:
+#
+#   "spanish.dict"                a file in the dictionary folder; stored by
+#                                 name so that a portable copy of the NVDA
+#                                 configuration keeps working on another machine
+#   "D:\\dicts\\spanish.dict"     a reference to a file somewhere else; stored
+#                                 absolute, because a relative path would be
+#                                 relative to whatever NVDA's working directory
+#                                 happens to be
 #
 # Everything else follows from rcdict's one hard rule: matching is
 # first-match-wins in LOAD ORDER, so a later file cannot override an earlier one
@@ -59,7 +77,7 @@ def initConfig():
 
 
 def folderPath(create=False):
-	"""The folder dictionaries live in, created on demand.
+	"""The folder scanned for dictionaries, created on demand.
 
 	Not created unless asked for: a user with no dictionaries should not find an
 	empty folder in their configuration wondering what it wants from them.
@@ -70,7 +88,7 @@ def folderPath(create=False):
 	return path
 
 
-def installedNames():
+def folderNames():
 	"""Every dictionary file in the folder, sorted, whatever the order says."""
 	try:
 		return sorted(
@@ -82,37 +100,148 @@ def installedNames():
 		return []
 
 
-def mergeOrder(preferred):
-	"""The installed files, ordered by C{preferred}, unlisted ones appended.
+# --- entries ------------------------------------------------------------------
+#
+# An entry is the string that goes in the configuration and comes back out of
+# it: a bare name for a file in the folder, an absolute path for one anywhere
+# else. This is the only section that understands that distinction; the load
+# order below it, the driver and the settings panel all just pass entries
+# around and ask here whenever they need to know something about one.
 
-	Names in C{preferred} that are not installed drop out, and names that are
-	installed but unlisted are appended in sorted order. Matching is
-	case-insensitive but the folder's own spelling is what comes back, because
-	the filesystem is the authority on that and the config may hold whatever the
-	file was called when it was added.
 
-	Duplicates in C{preferred} collapse to the first occurrence, which is the
-	one that would have won anyway.
+def _fold(path):
+	"""One spelling of a path, for comparing two of them.
+
+	normcase does the Windows part of this - it is what turns a forward slash
+	someone typed into a backslash - and lower() is on top of it rather than
+	left to normcase because this module is tested off Windows, where normcase
+	is the identity, and a case rule that only holds on the target platform is
+	a case rule nothing checks.
 	"""
-	remaining = dict((n.lower(), n) for n in installedNames())
+	return os.path.normcase(path).lower()
+
+
+def normalize(entry):
+	"""The canonical form of one entry, or "" for something unusable.
+
+	A path that happens to point INTO the dictionary folder becomes a bare name,
+	so that adding a file already in the folder cannot produce a second listing
+	of the same file - and so that the entry survives the configuration being
+	carried to a machine where the folder is somewhere else.
+	"""
+	entry = entry.strip().strip('"')
+	if not entry:
+		return ""
+	if not os.path.dirname(entry):
+		return entry
+	path = os.path.abspath(entry)
+	if _fold(os.path.dirname(path)) == _fold(os.path.abspath(folderPath())):
+		return os.path.basename(path)
+	return path
+
+
+def inFolder(entry):
+	"""Is this entry one of the folder's own files rather than a reference?"""
+	return not os.path.dirname(entry)
+
+
+def fullPath(entry):
+	"""The file an entry names."""
+	return os.path.join(folderPath(), entry) if inFolder(entry) else entry
+
+
+def exists(entry):
+	"""Is the file there? A reference is allowed not to be; see mergeOrder."""
+	return os.path.isfile(fullPath(entry))
+
+
+def key(entry):
+	"""What makes two entries the same file, for de-duplication.
+
+	Case-folded, because Windows filesystems are, and the configuration may hold
+	whatever spelling the file was added under. Public because the settings
+	panel has to ask the same question of the list it is holding, and two
+	answers to "is this the same dictionary" would be one too many.
+	"""
+	return _fold(os.path.abspath(fullPath(entry)))
+
+
+def label(entry):
+	"""How one entry reads in the settings panel.
+
+	A folder file is just its name; there is one folder and the panel says where
+	it is. A reference has to carry its directory or two files called
+	spanish.dict are indistinguishable - and where the file is IS the
+	interesting part of a reference. A missing one says so rather than sitting
+	in the list looking as though it were doing something.
+	"""
+	if inFolder(entry):
+		name = entry
+	else:
+		name = "%s (%s)" % (os.path.basename(entry), os.path.dirname(entry))
+	return name if exists(entry) else "%s - not found" % name
+
+
+# --- load order ---------------------------------------------------------------
+
+
+def mergeOrder(preferred):
+	"""The dictionaries to load, ordered by C{preferred}, folder files appended.
+
+	Entries in C{preferred} are normalized and de-duplicated, then every .dict
+	file in the folder that none of them names is appended in sorted order. That
+	last clause is what keeps dropping a file into the folder working.
+
+	The two kinds of entry are treated differently when the file is not there,
+	and deliberately:
+
+	  - a folder entry that has gone drops out, because the folder is scanned
+	    and is therefore the authority on what is in it: a file deleted from it
+	    is gone, and keeping the name would be keeping a ghost.
+	  - a reference that has gone is KEPT, because it names a file this add-on
+	    does not control - on a memory stick not plugged in, a network share not
+	    mounted yet, a file its editor is halfway through rewriting. Dropping it
+	    would mean the user silently loses the reference for good the next time
+	    the panel saves. It is marked "not found" in the list and skipped at load
+	    time; removing it is the user's decision to make.
+
+	The folder's spelling of a name wins over the configuration's, because the
+	filesystem is the authority on that.
+	"""
+	folder = dict((key(n), n) for n in folderNames())
 	ordered = []
-	for name in preferred:
-		real = remaining.pop(os.path.basename(name).lower(), None)
-		if real is not None:
-			ordered.append(real)
-	ordered.extend(sorted(remaining.values()))
+	seen = set()
+	for entry in preferred:
+		entry = normalize(entry)
+		if not entry:
+			continue
+		k = key(entry)
+		if k in seen:
+			continue
+		if inFolder(entry):
+			entry = folder.get(k)
+			if entry is None:
+				continue
+		seen.add(k)
+		ordered.append(entry)
+	ordered.extend(sorted(
+		name for k, name in folder.items() if k not in seen))
 	return ordered
 
 
-def orderedNames():
-	"""The dictionary file names to load, in load order."""
+def orderedEntries():
+	"""The dictionaries to load, in load order, as entries."""
 	return mergeOrder(savedOrder())
 
 
 def orderedPaths():
-	"""The dictionary files to load, in load order, as full paths."""
-	folder = folderPath()
-	return [os.path.join(folder, name) for name in orderedNames()]
+	"""The dictionary files to load, in load order, as full paths.
+
+	Only the ones that are actually there: this is what the driver hands to
+	rcdict, and a reference to a file that is not currently reachable is a thing
+	to skip this time round, not an error.
+	"""
+	return [fullPath(e) for e in orderedEntries() if exists(e)]
 
 
 def savedOrder():
@@ -129,9 +258,9 @@ def savedOrder():
 		return []
 
 
-def setOrder(names):
-	"""Store the load order. Names only; the folder supplies the rest."""
+def setOrder(entries):
+	"""Store the load order."""
 	initConfig()
 	config.conf[CONFIG_SECTION]["dictionaries"] = [
-		os.path.basename(n) for n in names
+		e for e in (normalize(x) for x in entries) if e
 	]

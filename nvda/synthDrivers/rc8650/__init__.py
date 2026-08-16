@@ -516,9 +516,9 @@ class SynthDriver(SynthDriver):
 		example: rcdict.h and example.dict.
 
 		Returns (rules, files) for a caller that wants to report what happened.
-		(0, 0) is a perfectly good answer and means the folder is empty; None
-		means the attempt did not get far enough to say. Deliberately quiet
-		either way: a missing folder is the normal case, and every failure path
+		(0, 0) is a perfectly good answer and means there are none; None means
+		the attempt did not get far enough to say. Deliberately quiet either
+		way: having no dictionaries is the normal case, and every failure path
 		here leaves the synth working exactly as it did before dictionaries
 		existed. A dictionary must never be the reason a screen reader goes
 		quiet.

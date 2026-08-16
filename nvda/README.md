@@ -181,19 +181,28 @@ word, substring or regular expression.
 
 **[The dictionary format is documented in `DICTIONARY-GUIDE.md`](../rcdict/DICTIONARY-GUIDE.md)** - a self-contained guide written for users rather than for this repository, and the thing to hand to anyone who asks how to write one.
 
-Dictionaries are `.dict` files in `%APPDATA%\nvda\rc8650\`. They are arranged
-from **NVDA menu → Preferences → Settings → RC8650 dictionaries**, which has a
-list of the files in load order and five buttons:
+Dictionaries are `.dict` files. They are arranged from **NVDA menu →
+Preferences → Settings → RC8650 dictionaries**, which has a list of the files in
+load order and five buttons:
 
 | Button | Key | What it does |
 |---|---|---|
-| Add… | `Alt+D` | Copies a `.dict` file into the folder |
-| Remove | `Alt+R` | Deletes the selected file from the folder |
+| Add… | `Alt+D` | Adds a `.dict` file to the list, wherever it is |
+| Remove | `Alt+R` | Takes it out of the list |
 | Move up | `Alt+U` | Raises its priority |
 | Move down | `Alt+N` | Lowers it |
 | Reload dictionaries | `Alt+L` | Re-reads the files, so editing one does not mean restarting the synthesizer |
 
 `Alt+F` moves to the list itself.
+
+**Files are read where they are.** Add records where a file is; it does not copy
+it. So the dictionary you edit is the one the synthesizer reads: save it in your
+editor, press Reload, and the change is live. Keep them wherever suits — a
+folder of your own, a synced drive, a checkout under version control.
+
+A reference to a file that is not there right now (an unplugged drive, a share
+not mounted yet) stays in the list, marked *not found*, and is skipped until it
+comes back. Removing it is your decision, not the add-on's.
 
 **Order is the whole point of the list.** Rules are tried from the top down and
 the first match wins, so a file higher in the list overrides one below it — a
@@ -202,14 +211,17 @@ dictionaries, where the datasheet warns that `(RAT)` placed before `(RATING)`
 means `(RATING)` is never reached.) The order lives in NVDA's configuration,
 not in the filenames.
 
-A `.dict` file dropped into the folder by hand still works: anything the saved
-order has not seen is appended to the end, in sorted order. So the folder alone
-remains a complete way to use this, and the panel is how you take control of
-what beats what.
+**There is also a folder, for anyone who just wants somewhere to put one.**
+`%APPDATA%\nvda\rc8650\` is scanned as well: a `.dict` file dropped in there
+works with no configuration at all, appended after everything the list names, in
+sorted order. It is how dictionaries worked before there was a panel and it
+still works that way — the panel is how you take control of what beats what. Its
+files show in the list under their bare names, and because the folder is
+scanned rather than listed, Remove on one of them has to delete it; the panel
+says so and asks first. Remove on anything else only unlists it.
 
-The order is applied when the Settings dialog is closed with OK or Apply, or
-immediately by the Reload button. Adding and removing files happen at once,
-since they are changes to the folder rather than to a setting.
+The list is applied when the Settings dialog is closed with OK or Apply, or
+immediately by the Reload button.
 
 ## Known limitations
 
