@@ -20,7 +20,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 DST="${RCDICT_DEST:-$SRC/../../doubletalk-pc/doubletalk/rcdict}"
 
 FILES="rcdict.h rcdict.c rcdict_regex.h rcdict_regex.c remimu.h example.dict
-DICTIONARY-GUIDE.md"
+DICTIONARY-GUIDE.md dic2rcdict.py"
 
 if [ ! -d "$(dirname "$DST")" ]; then
     echo "no doubletalk-pc tree at $(dirname "$DST")" >&2
