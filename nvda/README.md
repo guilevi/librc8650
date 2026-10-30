@@ -1,4 +1,4 @@
-# RC8650 (emulated) — NVDA add-on
+# RC8650 / RC8660 (emulated) — NVDA add-on
 
 An NVDA synthesizer driver for `librc8650`. The chip's real firmware runs on an
 emulated Renesas M16C and the driver plays back the PCM its D/A converter would
@@ -20,28 +20,66 @@ have sent down a serial port.
 
        x86_64-w64-mingw32-objdump -p ../rc8650_64.dll | grep 'DLL Name'
 
-2. Copy the DLLs and your firmware image into the driver directory:
+2. Copy the DLLs into the driver directory:
 
        cp ../rc8650_64.dll ../rc8650_32.dll synthDrivers/rc8650/
-       cp ../../rc8650_m4_valid.srec        synthDrivers/rc8650/
 
-   The firmware is RC Systems' copyrighted code and is not distributed here.
-   The driver looks for `rc8650_m4_valid.srec`, `rc8650.srec`, or either name
-   with a `.gz` suffix — the S-record is about 900 KB of ASCII and gzips to a
-   third of that, which is worth doing since it is the bulk of the package.
+   The firmware is RC Systems' copyrighted code and is not distributed here;
+   see "Firmware" below for where users put theirs.
 
 3. Package it (an `.nvda-addon` is a zip with `manifest.ini` at the root):
 
        ./build_addon.sh                  # no firmware bundled
        ./build_addon.sh --with-firmware  # personal build - do not distribute
 
-4. Open the `.nvda-addon` on the Windows machine and pick **RC8650 (emulated)**
+4. Open the `.nvda-addon` on the Windows machine and pick **RC8650 / RC8660 (emulated)**
    in NVDA's synthesizer dialog. Without a firmware image the driver reports
    itself unavailable and will not appear in the list — that is the intended
    behaviour, not a failure.
 
 `manifest.ini`'s `author` and `url` are placeholders. Set them before this goes
 anywhere near another person.
+
+## Firmware
+
+The driver runs whichever RC Systems firmware image it is given: the five
+RC8650 v2.60 builds RCStudio ships, the RC8660 v3.44, and later revisions.
+Images are S-records (`.srec`, or `.srec.gz` at about a third of the size).
+`../tools/rcstudio2srec.py --all <RCStudio>/Bin -o firmware/` makes all six
+from RCStudio's own files, named for what they are:
+
+    rc8650-v2.60-m1.srec  rc8650-v2.60-m2.srec  rc8650-v2.60-m4.srec
+    rc8650-v2.60-m7.srec  rc8650-v2.60-m8.srec  rc8660-v3.44-m1.srec
+
+Users keep them in `<NVDA config>\rc8650\firmware\`, which an update of the
+add-on does not touch, and choose one in **NVDA settings → RC8650 firmware**
+(`globalPlugins/rc8650Firmware.py`): a list of every image found, each labelled
+from its own header, with **Add image…**, which copies a file into that folder,
+and **Open firmware folder**. OK restarts the synthesizer on the chosen image.
+Images beside the driver are found too, so a personal build can bundle one; with
+nothing chosen the driver prefers the old fixed name `rc8650_m4_valid.srec`, so
+an existing install keeps its voice.
+
+Nothing in the driver is written for one chip. The voices, their presets, the
+formant range and the rate ladder all come from librc8650's profile of the
+running firmware (`rc8650_get_profile`), most of it read back out of the
+firmware with its Interrogate command when the image is loaded, so a revision
+with more voices or wider ranges is picked up as it is. Switching chip family
+resets the voice-linked settings and the rate to the new chip's own, because a
+value saved for one means something else on the other.
+
+| | RC8650 v2.60 | RC8660 v3.44 |
+|---|---|---|
+| Voices | 8 | 11 (adds Goliath, Alvin, Gretchen) |
+| Formant | 0–9, default 5 | 0–99, default 50 |
+| Rate | 20 rungs: both speed scales interleaved | 14 rungs: its own scale, 0S–13S |
+| Index markers | 0–99 | 0–255 |
+
+Models 2 and 8 of the RC8650 power up at a slower rate than 1, 4 and 7; the rate
+slider starts at each image's own power-on rate.
+
+`tests/run.sh` with `FIRMWARE_DIR=<folder of images>` runs the driver on every
+image in it.
 
 ## What is mapped
 
@@ -52,14 +90,14 @@ untouched voice sounds exactly like the firmware intends.
 
 | NVDA setting | Command | Range | Voice-linked |
 |---|---|---|---|
-| Voice | `nO` | 0–7 | — |
-| Rate | `nS`, `nG` | 20 rungs, ~116–395 wpm | no |
+| Voice | `nO` | 0–7 (RC8660: 0–10) | — |
+| Rate | `nS`, `nG` | 20 rungs, ~116–395 wpm (RC8660: 14) | no |
 | Pitch | `nP` | 0–99 | yes |
 | Inflection | `nE` (expression) | 0–9 | yes |
 | Volume | `nV` | 0–9 | no |
 | Tone | `nX` | bass / normal / treble | yes |
 | Articulation | `nA` | 0–9 | yes |
-| Formant frequency | `nF` | 0–9 | yes |
+| Formant frequency | `nF` | 0–9 (RC8660: 0–99) | yes |
 | Reverb | `nR` | 0–9 | yes |
 | Word delay | `nT` | 0–15 | yes |
 | Punctuation | `nB` bits 1–0 | all / most / some / none | no |

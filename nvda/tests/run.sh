@@ -5,6 +5,7 @@
 #
 #   ./run.sh                     # uses ../../librc8650.dylib and the repo's firmware
 #   FIRMWARE=path ./run.sh       # a firmware image elsewhere
+#   FIRMWARE_DIR=dir ./run.sh    # also run the driver on every image in dir
 #
 # The driver is Windows-only in production (it loads rc8650_64.dll), but nothing
 # about the dictionary path is: the tests stage a copy of the driver package
@@ -37,3 +38,16 @@ python3 test_dictfiles.py ../synthDrivers/rc8650
 echo
 echo "== the driver, against the emulator"
 python3 test_dictionaries.py ../synthDrivers/rc8650 "$LIB" "$FIRMWARE"
+
+# Every image in FIRMWARE_DIR if it is set - tools/rcstudio2srec.py --all makes
+# a folder of them - otherwise just FIRMWARE.
+IMAGES=("$FIRMWARE")
+if [[ -n "${FIRMWARE_DIR:-}" ]]; then
+    IMAGES=()
+    for f in "$FIRMWARE_DIR"/*.srec "$FIRMWARE_DIR"/*.srec.gz; do
+        [[ -f "$f" ]] && IMAGES+=("$f")
+    done
+fi
+echo
+echo "== firmware: the catalog, and the driver on each image"
+python3 test_firmware.py ../synthDrivers/rc8650 "$LIB" "${IMAGES[@]}"

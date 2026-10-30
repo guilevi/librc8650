@@ -29,12 +29,16 @@ for f in synthDrivers/rc8650/rc8650_64.dll synthDrivers/rc8650/rc8650_32.dll; do
     [[ -f "$f" ]] || { echo "missing $f - run 'make -C .. windows' first" >&2; exit 1; }
 done
 
-# The firmware, whichever name and form it was supplied under. Kept in step
-# with _FIRMWARE_NAMES in synthDrivers/rc8650/__init__.py.
+# Firmware images beside the driver, under any name: the driver runs whichever
+# is chosen (synthDrivers/rc8650/firmware.py), so every .srec and .srec.gz is
+# one, and every one is left out of a distributable build. Users keep theirs
+# in <nvda config>/rc8650/firmware/, which an update does not touch.
 FW=()
-for f in rc8650_m4_valid.srec rc8650_m4_valid.srec.gz rc8650.srec rc8650.srec.gz; do
-    [[ -f "synthDrivers/rc8650/$f" ]] && FW+=("synthDrivers/rc8650/$f")
+shopt -s nullglob
+for f in synthDrivers/rc8650/*.srec synthDrivers/rc8650/*.srec.gz; do
+    FW+=("$f")
 done
+shopt -u nullglob
 
 # globalPlugins/ carries the dictionaries settings category. It has to be a
 # global plugin rather than part of the driver - a driver module comes and goes

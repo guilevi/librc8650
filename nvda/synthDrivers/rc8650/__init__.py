@@ -1,4 +1,4 @@
-# RC8650 (emulated) synth driver for NVDA.
+# RC8650 / RC8660 (emulated) synth driver for NVDA.
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -18,10 +18,19 @@
 # Files expected next to this __init__.py:
 #   rc8650_64.dll         - `make win64` (NVDA 2025.2+ is a 64-bit process)
 #   rc8650_32.dll         - `make win32` (older, 32-bit NVDA)
-#   rc8650_m4_valid.srec  - the RC8650 firmware image, in Motorola S-record
-#                           form (.srec.gz is also accepted). RC Systems'
-#                           copyrighted code: not distributed with the add-on,
-#                           supply your own.
+#
+# And at least one firmware image, in Motorola S-record form (.srec, or
+# .srec.gz), in <nvda config>/rc8650/firmware/ or beside this file: RC Systems'
+# copyrighted code, not distributed with the add-on - supply your own.
+# tools/rcstudio2srec.py makes them from RCStudio's files. Any of the six
+# RCStudio sets runs - five RC8650 v2.60 builds and the RC8660 v3.44 - and
+# which one is chosen in NVDA's settings, "RC8650 firmware" (firmware.py).
+#
+# Nothing below assumes which chip that is. The voices, their presets, the
+# formant range and the rate ladder all come from librc8650's profile of the
+# loaded firmware (rc8650_get_profile), most of it read back out of the
+# firmware itself, so a later revision with more voices or wider ranges is
+# picked up without a change here.
 #
 # Command reference throughout is the RC8650 datasheet ("RC8650 Commands,
 # Firmware v2.60"); table numbers cited in comments are its own. Everything
@@ -38,7 +47,6 @@ import ctypes
 # Private CPython API, but the public spelling (windll.kernel32.FreeLibrary)
 # truncates the HMODULE on 64-bit unless its argtypes are set by hand.
 from _ctypes import FreeLibrary
-import gzip
 import os
 import re
 import threading
@@ -89,15 +97,7 @@ MARKER_COUNT = 64
 # ~102 ms and markers come one per index, so this is only ever a ceiling.
 MARKERS_PER_READ = 16
 
-# The firmware image, in the order tried. The name librc8650's own CLI uses
-# comes first; the .gz forms are accepted because the S-record is ~900 KB of
-# ASCII that compresses to about a tenth of that.
-_FIRMWARE_NAMES = (
-	"rc8650_m4_valid.srec",
-	"rc8650_m4_valid.srec.gz",
-	"rc8650.srec",
-	"rc8650.srec.gz",
-)
+from . import firmware
 
 
 def _dllName():
@@ -121,12 +121,35 @@ class _Rc8650IndexMark(ctypes.Structure):
 	]
 
 
-def _findFirmware():
-	for name in _FIRMWARE_NAMES:
-		path = os.path.join(_DIR, name)
-		if os.path.isfile(path):
-			return path
-	return None
+class _Rc8650Preset(ctypes.Structure):
+	# rc8650.h's rc8650_preset: what selecting a voice loads, in card units.
+	_fields_ = [(name, ctypes.c_uint8) for name in (
+		"pitch", "articulation", "formant", "tone", "expression", "reverb",
+		"word_delay", "reserved")]
+
+
+class _Rc8650Rung(ctypes.Structure):
+	# rc8650.h's rc8650_rung: one step of the rate ladder.
+	_fields_ = [
+		("v86", ctypes.c_uint8),
+		("speed", ctypes.c_uint8),
+		("reserved", ctypes.c_uint16),
+		("samples", ctypes.c_uint32),
+	]
+
+
+class _Rc8650Profile(ctypes.Structure):
+	# rc8650.h's rc8650_profile. Natural alignment throughout, which is what
+	# ctypes and both mingw targets agree on: eleven unsigned ints, then the
+	# pointer array (padded to 8 on 64-bit), then two arrays of 8-byte structs.
+	_fields_ = [(name, ctypes.c_uint) for name in (
+		"chip", "version", "model", "interrogate_len", "max_index_mark",
+		"voices", "speed_max_v86", "speed_max_v8600", "formant_max", "rungs",
+		"rate_default")] + [
+		("voice_name", ctypes.c_char_p * 32),
+		("preset", _Rc8650Preset * 32),
+		("rate", _Rc8650Rung * 64),
+	]
 
 
 class _Rc8650DLL:
@@ -167,6 +190,9 @@ class _Rc8650DLL:
 		lib.rc8650_sample_rate.argtypes = []
 		lib.rc8650_version.restype = ctypes.c_char_p
 		lib.rc8650_version.argtypes = []
+		lib.rc8650_get_profile.restype = ctypes.c_int
+		lib.rc8650_get_profile.argtypes = [
+			ctypes.c_void_p, ctypes.POINTER(_Rc8650Profile)]
 		# Pronunciation dictionary. rcdict is its own BSD-3 module inside the
 		# DLL, so these are its symbols rather than the library's; only
 		# set_dictionary and expand belong to librc8650.
@@ -197,14 +223,13 @@ class _Rc8650DLL:
 		# *next* attempt fail for a different and much more confusing reason.
 		self.handle = None
 		try:
-			path = _findFirmware()
+			path = firmware.chosen()
 			if not path:
 				raise RuntimeError(
-					"no RC8650 firmware image next to the driver (looked for %s)"
-					% ", ".join(_FIRMWARE_NAMES))
-			opener = gzip.open if path.endswith(".gz") else open
-			with opener(path, "rb") as f:
-				srec = f.read()
+					"no firmware image in %s or beside the driver"
+					% firmware.folderPath())
+			self.firmwarePath = path
+			srec = firmware.readText(path)
 			err = ctypes.c_char_p()
 			self.handle = lib.rc8650_new_from_memory(srec, len(srec), ctypes.byref(err))
 			if not self.handle:
@@ -223,9 +248,16 @@ class _Rc8650DLL:
 			# than letting them fall through to the query-reply stream.
 			lib.rc8650_set_index_marks(self.handle, 1)
 			self.sample_rate = lib.rc8650_sample_rate()
-			log.debug("rc8650: %s at %d Hz, firmware %s"
-				% (lib.rc8650_version().decode("utf-8", "replace"),
-					self.sample_rate, os.path.basename(path)))
+			# What this firmware offers. Probed once, before anything is
+			# spoken, and the chip is left at its power-on settings after.
+			self.profile = _Rc8650Profile()
+			if lib.rc8650_get_profile(self.handle, ctypes.byref(self.profile)) != 0:
+				raise RuntimeError("the firmware in %s did not answer" % path)
+			p = self.profile
+			log.info("rc8650: %s, RC%d firmware %x.%02x model %d: %d voices, "
+				"formant 0-%d, %d rate steps"
+				% (os.path.basename(path), p.chip, p.version >> 8,
+					p.version & 0xff, p.model, p.voices, p.formant_max, p.rungs))
 		except Exception:
 			self.close()
 			raise
@@ -248,7 +280,7 @@ class _Rc8650DLL:
 
 class SynthDriver(SynthDriver):
 	name = "rc8650"
-	description = "RC8650 (emulated)"
+	description = "RC8650 / RC8660 (emulated)"
 
 	# --- how the chip's settings are presented -------------------------------
 	#
@@ -261,88 +293,81 @@ class SynthDriver(SynthDriver):
 	# the settings ring steps by normalStep while the sliders in the Voice
 	# Settings dialog step by minStep.
 
-	supportedSettings = (
-		SynthDriver.VoiceSetting(),
-		# Rate is a 20-position ladder, not the chip's bare 0-9 speed; see
-		# _RATE_LADDER for why and what the extra ten positions are.
-		SynthDriver.RateSetting(minStep=5),
-		SynthDriver.PitchSetting(),
-		# Inflection is the chip's Expression (nE 0-9): 0 is a monotone, 9 is
-		# very animated. Ten slider stops for ten card values (see _map0to9).
-		SynthDriver.InflectionSetting(minStep=10),
-		SynthDriver.VolumeSetting(minStep=10),
-		# nX tone: bass (0X), normal (1X, the default), treble (2X) - the
-		# datasheet likens it to a stereo's bass/treble controls.
-		DriverSetting("tone", "&Tone", availableInSettingsRing=True, defaultVal="1"),
-		# nA 0-9. Low values slur the voice, high values make it choppy.
-		NumericDriverSetting("articulation", "&Articulation",
-			availableInSettingsRing=True, defaultVal=5,
-			minVal=0, maxVal=9, minStep=1, normalStep=1, largeStep=3),
-		# nF 0-9: the synthesizer's overall frequency response (vocal-tract
-		# formant frequencies). Retunes the voice type rather than its speed.
-		NumericDriverSetting("formant", "&Formant frequency",
-			availableInSettingsRing=True, defaultVal=5,
-			minVal=0, maxVal=9, minStep=1, normalStep=1, largeStep=3),
-		# nR 0-9: 0 is dry, higher values lengthen the reverb.
-		NumericDriverSetting("reverb", "Re&verb",
-			availableInSettingsRing=True, defaultVal=0,
-			minVal=0, maxVal=9, minStep=1, normalStep=1, largeStep=3),
-		# nT 0-15: extra pause between words. The datasheet offers it as an
-		# intelligibility aid for listeners new to synthetic speech.
-		NumericDriverSetting("worddelay", "&Word delay",
-			availableInSettingsRing=True, defaultVal=0,
-			minVal=0, maxVal=15, minStep=1, normalStep=1, largeStep=5),
-		# The four fields of the Punctuation Filter Register (nB, Table 8),
-		# split into the four independent things it actually controls.
-		DriverSetting("punctuation", "&Punctuation",
-			availableInSettingsRing=True, defaultVal="2"),
-		BooleanDriverSetting("numbers", "Read &numbers as numbers",
-			availableInSettingsRing=True, defaultVal=True),
-		BooleanDriverSetting("leadingzeros", "Speak &leading zeros",
-			availableInSettingsRing=True, defaultVal=True),
-		BooleanDriverSetting("years", "Read four-digit numbers as &years",
-			availableInSettingsRing=True, defaultVal=True),
-		# Reconstruction filter of the modeled output stage (not a chip
-		# command). See _filters.
-		DriverSetting("filter", "Output &filter",
-			availableInSettingsRing=True, defaultVal="3000"),
-	)
+	def _buildSettings(self):
+		# Built per instance from the loaded firmware's profile, because the
+		# ranges are the chip's: formant runs 0-9 on the RC8650 and 0-99 on the
+		# RC8660, and the rate ladder has as many steps as the chip has speeds.
+		# NVDA reads supportedSettings from the instance, so a firmware switch -
+		# which makes a new instance - brings the new ranges with it.
+		p = self._rc.profile
+		return (
+			SynthDriver.VoiceSetting(),
+			# Rate is a ladder, not the chip's bare speed: on the RC8650 both
+			# of its speed scales interleaved into twenty rungs. See
+			# _RATE_LADDER and _loadProfile.
+			SynthDriver.RateSetting(minStep=self._rateStep),
+			SynthDriver.PitchSetting(),
+			# Inflection is the chip's Expression (nE 0-9): 0 is a monotone, 9 is
+			# very animated. Ten slider stops for ten card values (see _map0to9).
+			SynthDriver.InflectionSetting(minStep=10),
+			SynthDriver.VolumeSetting(minStep=10),
+			# nX tone: bass (0X), normal (1X, the default), treble (2X) - the
+			# datasheet likens it to a stereo's bass/treble controls.
+			DriverSetting("tone", "&Tone", availableInSettingsRing=True, defaultVal="1"),
+			# nA 0-9. Low values slur the voice, high values make it choppy.
+			NumericDriverSetting("articulation", "&Articulation",
+				availableInSettingsRing=True, defaultVal=5,
+				minVal=0, maxVal=9, minStep=1, normalStep=1, largeStep=3),
+			# nF: the synthesizer's overall frequency response (vocal-tract formant
+			# frequencies) - 0-9 on the RC8650, 0-99 on the RC8660. It is the D/A
+			# clock that moves, so a higher setting is also a little faster and
+			# higher-pitched; see "Sample rate" in the library's README.
+			NumericDriverSetting("formant", "&Formant frequency",
+				availableInSettingsRing=True, defaultVal=p.preset[0].formant,
+				minVal=0, maxVal=p.formant_max, minStep=1, normalStep=1,
+				largeStep=max(3, (p.formant_max + 1) // 10)),
+			# nR 0-9: 0 is dry, higher values lengthen the reverb.
+			NumericDriverSetting("reverb", "Re&verb",
+				availableInSettingsRing=True, defaultVal=0,
+				minVal=0, maxVal=9, minStep=1, normalStep=1, largeStep=3),
+			# nT 0-15: extra pause between words. The datasheet offers it as an
+			# intelligibility aid for listeners new to synthetic speech.
+			NumericDriverSetting("worddelay", "&Word delay",
+				availableInSettingsRing=True, defaultVal=0,
+				minVal=0, maxVal=15, minStep=1, normalStep=1, largeStep=5),
+			# The four fields of the Punctuation Filter Register (nB, Table 8),
+			# split into the four independent things it actually controls.
+			DriverSetting("punctuation", "&Punctuation",
+				availableInSettingsRing=True, defaultVal="2"),
+			BooleanDriverSetting("numbers", "Read &numbers as numbers",
+				availableInSettingsRing=True, defaultVal=True),
+			BooleanDriverSetting("leadingzeros", "Speak &leading zeros",
+				availableInSettingsRing=True, defaultVal=True),
+			BooleanDriverSetting("years", "Read four-digit numbers as &years",
+				availableInSettingsRing=True, defaultVal=True),
+			# Reconstruction filter of the modeled output stage (not a chip
+			# command). See _filters.
+			DriverSetting("filter", "Output &filter",
+				availableInSettingsRing=True, defaultVal="3000"),
+		)
+
+	def _get_supportedSettings(self):
+		return self._settings
+
+	supportedSettings = property(_get_supportedSettings)
+
 	supportedCommands = {IndexCommand, PitchCommand, RateCommand, VolumeCommand}
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
 
-	# nO voice numbers 0-7, names per the datasheet's Table 7. Unlike the
-	# DoubleTalk PC's eight, none of these are aliases: all eight presets below
-	# are distinct.
-	_voices = {
-		"0": VoiceInfo("0", "Perfect Paul", "en"),
-		"1": VoiceInfo("1", "Vader", "en"),
-		"2": VoiceInfo("2", "Big Bob", "en"),
-		"3": VoiceInfo("3", "Precise Pete", "en"),
-		"4": VoiceInfo("4", "Ricochet Randy", "en"),
-		"5": VoiceInfo("5", "Biff", "en"),
-		"6": VoiceInfo("6", "Skip", "en"),
-		"7": VoiceInfo("7", "Robo Robert", "en"),
-	}
-
-	# Firmware voice presets, keyed by nO voice id, in CARD-NATIVE units:
-	# (pitch 0-99, articulation 0-9, formant 0-9, tone 0-2, expression 0-9,
-	# reverb 0-9, word delay 0-15).
+	# The voices (nO) and their presets come from the firmware: eight on the
+	# RC8650 (Table 7), eleven on the RC8660. Each preset row is what selecting
+	# that voice loads, in CARD-NATIVE units - (pitch, articulation, formant,
+	# tone, expression, reverb, word delay) - read back out of the chip with
+	# the Interrogate command (12?) by librc8650 when the firmware is loaded,
+	# so they are exact for whichever image is running. On the RC8650 they are
+	# the familiar ones: Vader's pitch 10 and reverb 3, Skip's formant 9, Robo
+	# Robert's flat 0 expression and its word delay of 1. See _loadProfile.
 	#
-	# These are not guesses: each row was read back out of the emulated chip
-	# with the Interrogate command (12?) after selecting that voice. Selecting
-	# nO loads them, which is what gives each voice its character - Vader's
-	# pitch 10 and reverb 3, Skip's formant 9, Robo Robert's flat 0 expression
-	# and its word delay of 1.
-	_voicePresets = {
-		"0": (50, 5, 5, 1, 5, 0, 0),  # Perfect Paul
-		"1": (10, 4, 0, 1, 6, 3, 0),  # Vader
-		"2": (40, 5, 3, 0, 5, 0, 0),  # Big Bob
-		"3": (60, 6, 6, 2, 4, 0, 0),  # Precise Pete
-		"4": (40, 5, 5, 1, 5, 9, 0),  # Ricochet Randy
-		"5": (50, 6, 0, 0, 7, 0, 0),  # Biff
-		"6": (15, 6, 9, 0, 7, 0, 0),  # Skip
-		"7": (80, 5, 7, 1, 0, 6, 1),  # Robo Robert
-	}
 	# Index into a _voicePresets row.
 	_P_PITCH, _P_ARTIC, _P_FORMANT, _P_TONE, _P_EXPR, _P_REVERB, _P_DELAY = range(7)
 
@@ -362,14 +387,14 @@ class SynthDriver(SynthDriver):
 	# returns identical presets. Its only other documented effect is on which
 	# characters the status messages use, and the driver accepts both sets.
 	# Durations were measured on one fixed sentence per rung.
-	_RATE_LADDER = (
-		(0, 0), (0, 1), (0, 2), (0, 3), (0, 4),
-		(128, 0), (0, 5), (0, 6), (128, 1), (0, 7),
-		(128, 2), (128, 3), (0, 8), (128, 4), (0, 9),
-		(128, 5), (128, 6), (128, 7), (128, 8), (128, 9),
-	)
-	# Slider position of (128, 1), the chip's own power-on rate.
-	_RATE_DEFAULT = 45
+	#
+	# That is the RC8650's ladder; it now comes from librc8650's profile
+	# (re-measured there, which swapped two near-equal pairs from the order
+	# this driver used to carry). The RC8660's is its own scale alone, 0S-13S:
+	# clearing V86 on it switches to V8600 compatibility, which also narrows
+	# the formant setting to 0-9, so its scales are not interleaved. Firmware
+	# the library does not know gets the scale it powers up on. See
+	# _loadProfile.
 
 	# POR bit 0 (STM), OR'd into every value above. See _prefix. Re-timing the
 	# whole ladder with the bit set changed 19 of the 20 rungs by not one
@@ -411,10 +436,52 @@ class SynthDriver(SynthDriver):
 
 	@classmethod
 	def check(cls):
-		return os.path.isfile(os.path.join(_DIR, _dllName())) and _findFirmware() is not None
+		return os.path.isfile(os.path.join(_DIR, _dllName())) and firmware.chosen() is not None
+
+	def _loadProfile(self):
+		# Everything chip-specific, from the profile librc8650 took of the
+		# loaded firmware.
+		p = self._rc.profile
+		self._voices = {}
+		self._voicePresets = {}
+		for v in range(p.voices):
+			name = p.voice_name[v]
+			name = name.decode("ascii", "replace") if name else "Voice %d" % v
+			self._voices[str(v)] = VoiceInfo(str(v), name, "en")
+			q = p.preset[v]
+			self._voicePresets[str(v)] = (
+				q.pitch, q.articulation, q.formant, q.tone, q.expression,
+				q.reverb, q.word_delay)
+		# (POR value, nS) per rung, slowest first. The register value is just
+		# the V86 bit: STM is OR'd in where it is sent (see _prefix).
+		self._RATE_LADDER = tuple(
+			(p.rate[i].v86, p.rate[i].speed) for i in range(p.rungs))
+		# The slider runs in equal steps, one per rung: 5% for the RC8650's
+		# twenty, which is what saved settings were written against, 7% for the
+		# RC8660's fourteen. A rung is pct // step - 1.
+		self._rateStep = max(1, 100 // max(1, p.rungs))
+		self._RATE_DEFAULT = (p.rate_default + 1) * self._rateStep
+		self._settings = self._buildSettings()
+		#: 8650 or 8660, so the settings panel can tell a change of chip from a
+		#: change of revision when the firmware is switched.
+		self.chip = p.chip
+
+	def adoptFirmwareDefaults(self):
+		"""Start from this firmware's own settings: the voice-linked ones from
+		the current voice's preset (or the first voice's, if this chip has no
+		such voice) and the rate from the chip's power-on rung.
+
+		For a switch of chip, where the saved values were written for the other
+		one: a formant of 5 is the RC8650's default and the bottom of the
+		RC8660's 0-99."""
+		if self._voice not in self._voices:
+			self._voice = "0"
+		self._applyPreset(self._voice)
+		self._rate = self._RATE_DEFAULT
 
 	def __init__(self):
 		self._rc = _Rc8650DLL()
+		self._loadProfile()
 		# Serializes EVERY ctypes call into the (not thread-safe) engine across
 		# the main thread (cancel/terminate/settings) and the synth thread.
 		self._libLock = threading.Lock()
@@ -811,9 +878,11 @@ class SynthDriver(SynthDriver):
 		return (v + 1) * 10
 
 	def _mapRate(self, pct):
-		# NVDA rate slider -> a rung of _RATE_LADDER. The slider runs 5-100 in
-		# steps of 5: twenty stops for the ladder's twenty rungs.
-		return self._RATE_LADDER[max(0, min(len(self._RATE_LADDER) - 1, pct // 5 - 1))]
+		# NVDA rate slider -> a rung of _RATE_LADDER, one slider step per rung
+		# (see _loadProfile): for the RC8650's twenty, the 5-100 in steps of 5
+		# this driver has always had.
+		return self._RATE_LADDER[max(0, min(len(self._RATE_LADDER) - 1,
+			pct // self._rateStep - 1))]
 
 	def _pfr(self):
 		# Punctuation Filter Register (Table 8): bits 1-0 filter mode, bit 2
@@ -923,7 +992,7 @@ class SynthDriver(SynthDriver):
 			value = self._volume if offset == 0 else min(100, max(10, self._volume + offset))
 			return "\x01%dV" % self._map0to9(value)
 		if isinstance(command, RateCommand):
-			value = self._rate if offset == 0 else min(100, max(5, self._rate + offset))
+			value = self._rate if offset == 0 else min(100, max(self._rateStep, self._rate + offset))
 			por, speed = self._mapRate(value)
 			# Keep STM set: this rewrites the whole register, and dropping the
 			# bit mid-utterance would silence the end-of-output message the

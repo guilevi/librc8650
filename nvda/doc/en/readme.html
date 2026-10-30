@@ -2,24 +2,44 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>RC8650 (emulated) — NVDA add-on</title>
+<title>RC8650 / RC8660 (emulated) — NVDA add-on</title>
 </head>
 <body>
-<h1>RC8650 (emulated)</h1>
+<h1>RC8650 / RC8660 (emulated)</h1>
 
-<p>An NVDA speech synthesizer that is an RC Systems RC8650 chip. Not a
+<p>An NVDA speech synthesizer that is an RC Systems RC8650 or RC8660 chip. Not a
 recreation of one: the chip's own firmware runs on an emulated Renesas M16C,
 and what you hear is the PCM its D/A converter would have produced. The
 voices, the text-to-speech and the command protocol are all the chip's.</p>
 
 <p>The firmware image is RC Systems' copyrighted code and is not distributed
-with this add-on. Until you place one next to the driver, the synthesizer will
-not appear in NVDA's list. See the add-on's README for where it goes.</p>
+with this add-on. Until you supply one, the synthesizer will not appear in
+NVDA's list.</p>
+
+<h2>Firmware</h2>
+
+<p>Firmware images are files ending in <code>.srec</code> or
+<code>.srec.gz</code>. Put them in the <code>rc8650\firmware</code> folder
+inside your NVDA user configuration folder, or use the settings page described
+below to add them. Updating the add-on does not remove them.</p>
+
+<p>To choose one, open NVDA's settings and go to the <strong>RC8650
+firmware</strong> category. The list shows every image found, each described by
+its chip, firmware version and board model, for example "RC8660 firmware 3.44,
+model 1". Select one and press OK; the synthesizer restarts on it. <strong>Add
+image</strong> copies a file into the firmware folder for you, and <strong>Open
+firmware folder</strong> opens it.</p>
+
+<p>The voices and settings follow the chip. The RC8650 has eight voices and a
+formant setting from 0 to 9; the RC8660 has eleven voices and a formant setting
+from 0 to 99. When you switch between the two chips, the voice settings and the
+rate go back to the new chip's own defaults.</p>
 
 <h2>Voices</h2>
 
-<p>Eight, selected with the chip's own Voice command. Each one loads a preset
-inside the firmware, which is what gives it its character.</p>
+<p>Eight on the RC8650, eleven on the RC8660, selected with the chip's own
+Voice command. Each one loads a preset inside the firmware, which is what gives
+it its character.</p>
 
 <table border="1">
 <tr><th>Voice</th><th>Character</th></tr>
@@ -32,6 +52,11 @@ inside the firmware, which is what gives it its character.</p>
 <tr><td>Skip</td><td>Low pitch with the highest formant — small and bright.</td></tr>
 <tr><td>Robo Robert</td><td>Very high pitch, no intonation at all, reverb, and a
 deliberate pause between words.</td></tr>
+<tr><td>Goliath (RC8660 only)</td><td>Low pitch with a very low formant, a touch of
+reverb.</td></tr>
+<tr><td>Alvin (RC8660 only)</td><td>Treble, with the formant almost at the top of its
+range: small and squeaky.</td></tr>
+<tr><td>Gretchen (RC8660 only)</td><td>The highest pitch of all, treble tone.</td></tr>
 </table>
 
 <h2>Settings</h2>
@@ -43,9 +68,9 @@ through untouched.</p>
 
 <table border="1">
 <tr><th>Setting</th><th>Chip command</th><th>What it does</th></tr>
-<tr><td>Rate</td><td>nS + nG</td><td>Twenty steps, roughly 116 to 395 words per
-minute. The chip has two ten-step speed scales; this is both of them merged
-into one.</td></tr>
+<tr><td>Rate</td><td>nS + nG</td><td>On the RC8650, twenty steps, roughly 116 to 395
+words per minute: the chip has two ten-step speed scales, and this is both of
+them merged into one. On the RC8660, its own fourteen steps.</td></tr>
 <tr><td>Pitch</td><td>nP</td><td>The chip's full 0–99 range.</td></tr>
 <tr><td>Inflection</td><td>nE</td><td>How much the pitch moves within a
 sentence. 0 is a monotone; the top is very animated.</td></tr>
@@ -53,8 +78,10 @@ sentence. 0 is a monotone; the top is very animated.</td></tr>
 <tr><td>Tone</td><td>nX</td><td>Bass, normal or treble.</td></tr>
 <tr><td>Articulation</td><td>nA</td><td>Low slurs the speech, high makes it
 choppy.</td></tr>
-<tr><td>Formant frequency</td><td>nF</td><td>Shifts the whole vocal tract —
-retunes the voice type rather than its speed.</td></tr>
+<tr><td>Formant frequency</td><td>nF</td><td>Shifts the whole vocal tract up or
+down, from 0 to 9 on the RC8650 and 0 to 99 on the RC8660. The chip does it by
+changing the speed of its sample clock, so a higher setting also speaks a little
+faster and higher.</td></tr>
 <tr><td>Reverb</td><td>nR</td><td>0 is dry; higher values lengthen it.</td></tr>
 <tr><td>Word delay</td><td>nT</td><td>Extra pause between words. The datasheet
 suggests it for listeners new to synthetic speech.</td></tr>

@@ -71,9 +71,15 @@ def initConfig():
 	Idempotent and safe to call from anywhere; both the driver and the settings
 	panel call it before touching config, because whichever of them runs first
 	cannot know that the other has.
+
+	Key by key rather than the whole section at once, because the section may
+	not be ours alone: another module can have declared it first with its own
+	keys, and declaring it only when absent would then leave ours out.
 	"""
-	if CONFIG_SECTION not in config.conf.spec:
-		config.conf.spec[CONFIG_SECTION] = _CONFIG_SPEC
+	section = config.conf.spec.setdefault(CONFIG_SECTION, {})
+	for key, value in _CONFIG_SPEC.items():
+		if key not in section:
+			section[key] = value
 
 
 def folderPath(create=False):
