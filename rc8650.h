@@ -239,6 +239,29 @@ uint64_t rc8650_samples_read (rc8650_t *e);
 /* Non-zero while there is queued input or undelivered audio. */
 int rc8650_is_speaking (rc8650_t *e);
 
+/* --- the A/D converter --------------------------------------------------- */
+
+/* The voltage on one of the chip's analog inputs, for its A/D converter (the
+ * n$ command, ADC Control Register, Table 9).  value is in 256ths of AVREF -
+ * what the chip's 8-bit conversion of that voltage would read.  All inputs
+ * start at 0.
+ *
+ * The chip sends conversion results to the host on its serial port, one byte
+ * per conversion, as Figure 16 shows: one byte for a one-shot conversion, one
+ * per channel for a sweep, and back to back in continuous mode, at a tenth of
+ * the baud rate, until the register is written with INH set.  Read them with
+ * rc8650_read_serial.  If index markers are on, a reading of 0-99 that
+ * arrives while rc8650_read is pumping audio is taken for a marker.
+ *
+ * Hardware triggering (TRG, the ADTRG pin) is not modelled: a conversion
+ * starts as soon as the register is written with INH = 0. */
+enum
+{
+  RC8650_AN0, RC8650_AN1, RC8650_AN2, RC8650_AN3,
+  RC8650_AMPOUT			/* converted instead of ANn when AMP is set */
+};
+void rc8650_set_analog_input (rc8650_t *e, unsigned channel, uint8_t value);
+
 /* --- misc --------------------------------------------------------------- */
 
 /* Chip identification, as returned by the 6? command: 8 bytes into buf.

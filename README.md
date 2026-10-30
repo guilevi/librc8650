@@ -359,6 +359,45 @@ between - since speech opens with two CPU writes before the DMA takes over, and
 rendering the gap between them put nine samples of silence in front of every
 first utterance.
 
+### The A/D converter
+
+`rc8650_set_analog_input()` sets the voltage on AN0-AN3 or AMPOUT, in 256ths of
+AVREF, and `n$` converts it. The chip sends each result to the host as one byte
+on its serial port, exactly as the datasheet's Figure 16 draws it - one byte for
+a one-shot conversion, one per channel for a sweep (`9$` gives AN0 then AN1,
+`11$` AN0 to AN3), and back to back in continuous mode until `128$` stops it.
+With AMP set the converter reads AMPOUT instead of the multiplexer. Read the
+bytes with `rc8650_read_serial()`.
+
+```c
+rc8650_set_analog_input(e, RC8650_AN0, 0x80);   /* half of AVREF */
+rc8650_command(e, "0$");                        /* one-shot, AN0 */
+uint8_t v;
+rc8650_read_serial(e, &v, 1);                   /* 0x80 */
+```
+
+Underneath, the firmware converts with the M16C's own A/D (ADCON0/1/2, AD0-AD7),
+waits for it, and hands the result to DMA channel 1, which copies it into UART0's
+transmit register each time the transmitter is free. That is why the datasheet
+puts the continuous sampling rate at a tenth of the baud rate, and the emulation
+gets it: 640 f1 cycles a byte at 115200 baud, 11,500 readings a second. Before
+the converter was modelled, `n$` with INH = 0 left the firmware polling for the
+end of a conversion that never came.
+
+**The emulated chip boots at 300 baud.** Its baud-rate select pins (BRS0-BRS2)
+read low, and Table 2 makes LLL 300 baud. Nothing else notices - the library
+hands bytes over without bit timing - but continuous conversions arrive at a
+tenth of the rate, 30 a second. Send `10H` first for 115200 baud and 11,520 a
+second (`5H` 9600, `9H` 57600). Tying the pins high instead would select
+auto-detect, which times the host's first character on the BRD pin, and the
+library has no bit timing to give it.
+
+The serial buffer holds 16 KB, over a second of readings at 115200 baud; drain
+it at least that often. Readings that arrive while `rc8650_read` is pumping
+audio are subject to the same filters as any other byte: with index markers on,
+one of 0-99 is taken for a marker, and with status messages on, the Table 3
+bytes (`s`, `t`, `B`, `E`, `e`, `f`) are consumed as status.
+
 ### Limits worth knowing
 
 - **One engine per process.** The emulator core keeps file-scope state, so a
@@ -401,8 +440,9 @@ do not:
   points DMA0 at U1TB (`0x3AA`) with request source 15, UART1 transmit, which the
   simulator does not model, so speech stops at the first sample. The library
   hands you the digital stream anyway, so there is no reason to switch this on.
-- **The A/D converter (`n$`) is not modelled** and answers nothing, and there is
-  no API to feed it a signal, so recording has nothing to record.
+- **The A/D converter's hardware trigger (TRG, the ADTRG pin) is not
+  modelled**: a conversion starts as soon as `n$` is written with INH = 0. The
+  rest of the converter is - see "The A/D converter" below.
 - **Prerecorded playback (`n&`)** needs a sound library downloaded with `223W`,
   which is untested.
 - **Timers A0 and A1 are not modelled.** The firmware chains them into a slow

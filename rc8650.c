@@ -35,6 +35,7 @@ extern void (*rc865x_hook_dac) (unsigned char);
 extern int m32c_rc865x_dac_period (void);
 extern unsigned long long m32c_f1_clock;
 extern int m32c_dma_write;
+extern unsigned char m32c_rc865x_adc_in[10];
 extern int trace, verbose, enable_counting, m32c_p6_driven;
 
 /* Instruction budgets.  These are generous ceilings, not expected costs: the
@@ -155,7 +156,10 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
  * bounded: audio can outrun the caller, so give it room for a couple of
  * seconds. */
 #define IN_CAP  8192
-#define SER_CAP 1024
+/* Replies are small, but the A/D converter in continuous mode sends a byte
+ * every character time - 11,520 a second at 115200 baud - so give it over a
+ * second's worth between drains. */
+#define SER_CAP 16384
 #define PCM_CAP 32768
 /* Index markers only accumulate between two reads, and the caller drains them
  * every chunk; even one marker per word could not fill this. */
@@ -781,7 +785,13 @@ boot (rc8650_t *e, char **err)
    * rc8650_reset lost its opening 558 samples. */
   init_mem ();
   init_regs ();
-  m32c_rc865x_reset ();
+  {
+    /* The analog inputs are the caller's, not the chip's: keep them. */
+    unsigned char in[sizeof m32c_rc865x_adc_in];
+    memcpy (in, m32c_rc865x_adc_in, sizeof in);
+    m32c_rc865x_reset ();
+    memcpy (m32c_rc865x_adc_in, in, sizeof in);
+  }
 
   /* The board configuration established in notes.md: bare-metal memory (no
    * newlib syscall traps), the RC865x peripheral set, port 8 bit 4 tied high
@@ -1416,6 +1426,18 @@ rc8650_is_speaking (rc8650_t *e)
   if (!e)
     return 0;
   return e->work || pcm_available (e) > 0;
+}
+
+void
+rc8650_set_analog_input (rc8650_t *e, unsigned channel, uint8_t value)
+{
+  /* AN0-AN3 are the M16C's own AN0-AN3.  AMPOUT is ANEX1: the AMP bit puts
+     the converter in external op-amp mode, which sends the selected pin out
+     on ANEX0 (AMPIN) and converts what comes back on ANEX1. */
+  static const unsigned char map[] = { 0, 1, 2, 3, 9 };
+
+  if (e && channel < sizeof map)
+    m32c_rc865x_adc_in[map[channel]] = value;
 }
 
 int

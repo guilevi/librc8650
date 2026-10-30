@@ -182,7 +182,7 @@
  }
 --- a/sim/m32c/mem.c
 +++ b/sim/m32c/mem.c
-@@ -43,6 +43,207 @@
+@@ -43,6 +43,243 @@
  #include "timer_a.h"
  #endif
  
@@ -283,6 +283,42 @@
 +   sample the DMA clocked out from one the CPU wrote itself.  */
 +unsigned long long m32c_f1_clock;
 +int m32c_dma_write;
++
++/* The A/D converter, as on the M16C/62: ADCON0 (0x03D6) holds the channel
++   (bits 0-2), the mode (bit 3 MD0, bit 4 MD1: one-shot, repeat, single
++   sweep, repeat sweep), the trigger select (bit 5) and the start bit ADST
++   (bit 6); ADCON1 (0x03D7) the sweep range (bits 0-1), 8 or 10 bits (bit 3)
++   and the clock select CKS1 (bit 4) with CKS0 (ADCON0 bit 7).  Results land
++   in AD0-AD7 (0x03C0, two bytes apart).  ADIC (0x004E) is requested when a
++   one-shot conversion or a single sweep has finished, and never in the
++   repeat modes - not per conversion: the firmware takes it as "the sweep is
++   done", and raising it after the first channel stopped a sweep there.  A conversion takes 49 cycles of the A/D clock in 8-bit mode and
++   59 in 10-bit, without sample and hold.  Hardware triggering (ADTRG) is not
++   modelled; a conversion starts when ADST is set either way.
++
++   The input on each pin comes from m32c_rc865x_adc_in[], in 1/256ths of
++   AVREF (for 10-bit results, the value shifted up two bits); an embedder sets
++   it.  Channels 8 and 9 stand for ANEX0 and ANEX1, which ADCON1's OPA bits
++   select: 01 converts ANEX0, 10 ANEX1, and 11 - the external op-amp mode,
++   which is what the RC8650's AMP bit sets - sends the selected pin out on
++   ANEX0 (AMPIN) and converts what comes back on ANEX1 (AMPOUT).  */
++unsigned char m32c_rc865x_adc_in[10];
++static struct
++{
++  int left, ch, on;
++} adc;
++
++/* When UART0's transmitter is next free, in f1 time.  Only the DMA request
++   it raises is modelled with this: request source 0x0A is "UART0 transmit",
++   and the firmware streams A/D results by pointing DMA1 from AD0 at U0TB on
++   that source - one byte per conversion, back to back in continuous mode,
++   which is why the datasheet's continuous sampling rate is a tenth of the
++   baud rate.  A channel on that source transfers whenever the transmitter is
++   free, as a level rather than an edge, which is what lets the firmware
++   enable DMA1 after a one-shot conversion and get its byte.  What the
++   firmware reads back from U0C0/U0C1 still says "empty" at once, so nothing
++   it sends itself is slowed.  */
++static unsigned long long uart0_free_at;
 +
 +/* The M16C DMA controller.  DMA0: SAR 0x20, DAR 0x24, TCR 0x28, DM0CON 0x2C,
 +   request select DM0SL 0x3B8; DMA1 the same shape at 0x30/0x34/0x38/0x3C,
@@ -390,7 +426,7 @@
  #define L1_BITS  (10)
  #define L2_BITS  (10)
  #define OFF_BITS (12)
-@@ -213,15 +414,49 @@
+@@ -213,15 +450,49 @@
    m = mem_ptr (address);
    if (trace)
      printf (" %02x", value);
@@ -441,7 +477,7 @@
  	int i;
  	if (old_led != value)
  	  {
-@@ -301,21 +536,90 @@
+@@ -301,21 +572,106 @@
        break;
  
      case 0x400:
@@ -475,6 +511,11 @@
 +    case 0x3a2:		/* m16c U0TB - UART0 transmit buffer */
 +      if (m32c_rc865x)
 +	{
++	  /* A frame is ten bits of 16 x (U0BRG + 1) cycles of the count
++	     source U0C0 selects: f1, f8 or f32.  */
++	  static const int clk[4] = { 1, 8, 32, 32 };
++	  uart0_free_at = m32c_f1_clock
++	    + 10 * 16 * (*mem_ptr (0x3a1) + 1) * clk[*mem_ptr (0x3a4) & 3];
 +	  if (m32c_tx_pc)
 +	    fprintf (stderr, "TX %02x from pc=%06lx\n", value,
 +		     (unsigned long) regs.r_pc);
@@ -497,6 +538,17 @@
 +	rc865x_hook_dac (value);
 +      else if (m32c_dac_file)
 +	putc (value, m32c_dac_file);
++      break;
++
++    case 0x3d6:		/* ADCON0 */
++      if ((value & 0x40) && !adc.on)
++	{
++	  adc.on = 1;
++	  adc.ch = (value & 0x10) ? 0 : (value & 7);	/* sweeps start at AN0 */
++	  adc.left = 0;
++	}
++      else if (!(value & 0x40))
++	adc.on = 0;
 +      break;
 +
 +    case 0x38c:		/* TA3 low */
@@ -537,7 +589,7 @@
  }
  
  void
-@@ -330,7 +634,7 @@
+@@ -330,7 +686,7 @@
  void
  mem_put_hi (int address, unsigned short value)
  {
@@ -546,7 +598,7 @@
      {
        printf ("SimTrace: %06lx %04x\n", regs.r_pc, value);
        return;
-@@ -414,12 +718,122 @@
+@@ -414,12 +770,122 @@
  }
  #endif
  
@@ -669,7 +721,7 @@
    switch (address)
      {
  #ifdef HAVE_TERMIOS_H
-@@ -618,3 +1032,187 @@
+@@ -618,3 +1084,244 @@
      }
  }
  #endif
@@ -801,6 +853,61 @@
 +    }
 +  m32c_f1_clock += f1;
 +
++  if (m32c_f1_clock >= uart0_free_at)
++    dma_service (0x0a);
++
++  if (adc.on)
++    {
++      unsigned char con0 = *mem_ptr (0x3d6), con1 = *mem_ptr (0x3d7);
++      int ten = (con1 & 0x08) != 0;
++      /* phiAD: fAD (= f1) with CKS1, else fAD/2 with CKS0, else fAD/4.  */
++      int clk = (con1 & 0x10) ? 1 : (con0 & 0x80) ? 2 : 4;
++
++      if (adc.left <= 0)
++	adc.left = (ten ? 59 : 49) * clk;
++      adc.left -= f1;
++      if (adc.left <= 0)
++	{
++	  int md = (con0 >> 3) & 3, opa = (con1 >> 6) & 3, last, v;
++	  int src = adc.ch;
++
++	  /* With the external amplifier selected, the converted channel is
++	     ANEX0 or ANEX1 rather than a pin.  */
++	  if (opa)
++	    src = opa == 1 ? 8 : 9;
++	  v = m32c_rc865x_adc_in[src];
++	  if (ten)
++	    v <<= 2;
++	  *mem_ptr (0x3c0 + 2 * adc.ch) = v & 0xff;
++	  *mem_ptr (0x3c1 + 2 * adc.ch) = v >> 8;
++
++	  /* SCAN 00-11: AN0-AN1, AN0-AN3, AN0-AN5, AN0-AN7.  */
++	  last = 2 * (con1 & 3) + 1;
++	  switch (md)
++	    {
++	    case 0:		/* one-shot */
++	      adc.on = 0;
++	      break;
++	    case 1:		/* repeat */
++	      break;
++	    case 2:		/* single sweep */
++	      if (adc.ch >= last)
++		adc.on = 0;
++	      else
++		adc.ch++;
++	      break;
++	    case 3:		/* repeat sweep */
++	      adc.ch = adc.ch >= last ? 0 : adc.ch + 1;
++	      break;
++	    }
++	  if (!adc.on)
++	    {
++	      *mem_ptr (0x3d6) &= ~0x40;	/* ADST clears when it is done */
++	      *mem_ptr (0x4e) |= 0x08;		/* ADIC: request */
++	    }
++	}
++    }
++
 +  /* UART0 receive.  The firmware only reads U0RB from its receive interrupt
 +     handler (0x0A04A0); its polling loop enters below that at 0x0A04A5.  Raise
 +     the request and let the controller below decide when to take it.  */
@@ -856,6 +963,8 @@
 +  m32c_p6_driven = 0;
 +  m32c_f1_clock = 0;
 +  m32c_dma_write = 0;
++  memset (&adc, 0, sizeof adc);
++  uart0_free_at = 0;
 +}
 --- a/sim/m32c/r8c.opc
 +++ b/sim/m32c/r8c.opc
