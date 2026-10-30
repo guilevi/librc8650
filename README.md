@@ -221,9 +221,16 @@ shorter than that pause, so the utterance gets declared over during its own
 opening and its speech surfaces glued to the front of the next one. Raising the
 threshold only trades that for latency on everything.
 
-Two things still fall back on the quiet heuristic because they report no status:
-text the chip declines to speak, and the tone, DTMF and recorded-audio
-generators.
+The tone, DTMF and recorded-audio generators send no Table 3 status, but they
+do drive TS0, and that is what ends their output - measured exact for the
+sinusoidal generator and the DTMF dialer; recorded-audio playback has not been
+measured. The quiet heuristic is left for text the chip declines to speak, and
+for TS held high with nothing coming out (the musical generator after its Quit
+frame, or the pin forced high with `3K`).
+
+Tone-generator and recorded-audio data go in through `rc8650_write`, which takes
+all of it however long it is: the input queue grows rather than dropping what
+the chip has not collected yet.
 
 **Fixed 2026-08-01: utterances that came back as nothing but the opening
 burst.** The chip emits a couple of hundred samples with TS still low, spends up

@@ -116,8 +116,13 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
 #define MSG_BUF_EMPTY    'e'
 #define MSG_BUF_FULL     'f'
 
-/* Bounded queues.  Input is small (the chip's own buffer is 2 KB); audio can
- * outrun the caller, so give it room for a couple of seconds. */
+/* Queues.  Input starts at IN_CAP and grows on demand, because rc8650_write
+ * promises to take all of len: text never comes near it (the chip's own
+ * buffer is 2 KB), but tone-generator and recorded-audio data are streams the
+ * chip consumes at its own pace, and a second of PCM is already over 10 KB.
+ * Dropping the overflow would truncate them without a word.  The others are
+ * bounded: audio can outrun the caller, so give it room for a couple of
+ * seconds. */
 #define IN_CAP  8192
 #define SER_CAP 1024
 #define PCM_CAP 32768
@@ -127,8 +132,8 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
 
 struct rc8650
 {
-  unsigned char in[IN_CAP];
-  size_t in_head, in_tail;
+  unsigned char *in;		/* grows; see in_put */
+  size_t in_cap, in_head, in_tail;
 
   unsigned char ser[SER_CAP];
   size_t ser_head, ser_tail;
@@ -348,6 +353,31 @@ ring_get (const unsigned char *buf, size_t cap, size_t head, size_t *tail,
   return n;
 }
 
+/* Queue one byte of input, doubling the ring when it is full.  Returns 1 if
+ * stored, 0 only if memory ran out. */
+static int
+in_put (rc8650_t *e, unsigned char v)
+{
+  if ((e->in_head + 1) % e->in_cap == e->in_tail)
+    {
+      size_t cap = e->in_cap * 2, n = 0;
+      unsigned char *in = malloc (cap);
+      if (!in)
+	return 0;
+      while (e->in_tail != e->in_head)
+	{
+	  in[n++] = e->in[e->in_tail];
+	  e->in_tail = (e->in_tail + 1) % e->in_cap;
+	}
+      free (e->in);
+      e->in = in;
+      e->in_cap = cap;
+      e->in_tail = 0;
+      e->in_head = n;
+    }
+  return ring_put (e->in, e->in_cap, &e->in_head, e->in_tail, v);
+}
+
 /* --- hooks called from the emulator core --------------------------------- */
 
 static int
@@ -357,7 +387,7 @@ hook_rx (unsigned char *b)
   if (!e || RING_EMPTY (e, in))
     return 0;			/* nothing queued: not EOF, just idle */
   *b = e->in[e->in_tail];
-  e->in_tail = (e->in_tail + 1) % IN_CAP;
+  e->in_tail = (e->in_tail + 1) % e->in_cap;
   return 1;
 }
 
@@ -685,6 +715,15 @@ rc8650_new_from_memory (const void *srec, size_t len, char **err)
     }
   memcpy (e->image_srec, srec, len);
   e->image_srec_len = len;
+  e->in = malloc (IN_CAP);
+  if (!e->in)
+    {
+      free (e->image_srec);
+      free (e);
+      set_err (err, "out of memory");
+      return NULL;
+    }
+  e->in_cap = IN_CAP;
   biquad_design (e, RC8650_DEFAULT_LOWPASS_HZ);
   rcdict_options_init (&e->dict, &rcdict_rc8650);
 
@@ -757,6 +796,7 @@ rc8650_free (rc8650_t *e)
       rc865x_hook_dac = NULL;
       the_engine = NULL;
     }
+  free (e->in);
   free (e->image_srec);
   free (e->image);
   free (e);
@@ -784,7 +824,8 @@ rc8650_write (rc8650_t *e, const void *data, size_t len)
   if (!e || !p)
     return;
   for (i = 0; i < len; i++)
-    ring_put (e->in, IN_CAP, &e->in_head, e->in_tail, p[i]);
+    if (!in_put (e, p[i]))
+      break;			/* out of memory: nothing better to do */
   e->work = 1;
   e->started = e->heard = 0;
   e->thinking = 0;
@@ -873,7 +914,7 @@ rc8650_stop (rc8650_t *e)
   /* Drop what the host queued but the chip has not collected yet, then hand
      over the chip's own Stop. */
   e->in_head = e->in_tail = 0;
-  ring_put (e->in, IN_CAP, &e->in_head, e->in_tail, ctrl_x);
+  in_put (e, ctrl_x);
 
   /* Deliver it, here and now.  Queuing the byte is not enough: the CPU only
      advances inside a read, and a caller that cancels goes on to write the
