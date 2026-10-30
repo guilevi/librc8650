@@ -121,6 +121,11 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
  * be draining after the audio side has gone idle.  See rc8650_read_serial. */
 #define SERIAL_GRACE   100000UL
 
+/* How much of the pause after a full stop rc8650_stop lets the chip play, in
+ * samples, so that its text translator lets go of a sentence a cancel cut off.
+ * See rc8650_stop. */
+#define CANCEL_PAUSE 256
+
 /* How long rc8650_stop runs the CPU to get the Stop actually delivered.  A
  * stop is over in a few thousand instructions; this is a ceiling. */
 #define STOP_CAP      2000000UL
@@ -977,14 +982,14 @@ rc8650_command (rc8650_t *e, const char *cmd)
   rc8650_write (e, "\r", 1);
 }
 
-void
-rc8650_stop (rc8650_t *e)
+static size_t pcm_available (rc8650_t *e);
+
+/* Hand the chip a CTRL+X and run it until it has taken effect. */
+static void
+deliver_stop (rc8650_t *e)
 {
   unsigned char ctrl_x = 0x18;
   unsigned long budget;
-
-  if (!e)
-    return;
 
   /* Drop what the host queued but the chip has not collected yet, then hand
      over the chip's own Stop. */
@@ -1039,6 +1044,52 @@ rc8650_stop (rc8650_t *e)
   /* Whatever the filter was ringing on has just been dropped; carrying its
      state into the next utterance would start it with a click. */
   biquad_reset (e);
+}
+
+void
+rc8650_stop (rc8650_t *e)
+{
+  int interrupted;
+  unsigned long budget;
+  uint64_t start;
+
+  if (!e)
+    return;
+  interrupted = e->work || !RING_EMPTY (e, in) || pcm_available (e) > 0;
+  deliver_stop (e);
+  if (!interrupted || !e->booted)
+    return;
+
+  /* A Stop leaves the text translator mid-sentence.  Its output for the next
+     utterance then lacks the sentence-initial pitch reset and phrase markers
+     ("p2 / /" in the stream at 0x10BC), and that utterance is spoken with
+     different prosody: "Hello there." after a cancel came back 500 samples
+     longer and different throughout, at all twelve interrupt points tried.
+     Whether the board does the same is not known, but a cancel that colours
+     the next thing said is not what a caller means by one.
+
+     What is left behind is the cut-off sentence's text, still in the
+     translator's window at 0x08FB (upper-cased, up to its period), and the
+     translator's place in it; after a sentence that ran to the end that window
+     is empty.  A full stop is what clears it.  So give the chip one, let it
+     run into the silent sentence-final pause that follows, and stop again.
+
+     How far into the pause is measured, not derived: the translator finishes
+     with the period somewhere in its first 64 samples, depending on where the
+     sentence was cut (2 samples fixed four interrupt points of twelve, 32 fixed
+     ten, 64 all twelve).  CANCEL_PAUSE is four times that.  Twelve of twelve
+     follow-on utterances then match a clean one byte for byte, for about
+     10 ms of host time.  TS is no use as the signal: it rises before the
+     pause, when the period has not been dealt with yet. */
+  in_put (e, '.');
+  in_put (e, '\r');
+  start = e->samples_out;
+  e->audio_pump = 1;		/* its start message is status, not a reply */
+  budget = THINK_CAP;
+  while (budget-- && e->samples_out - start < CANCEL_PAUSE)
+    step (e);
+  e->audio_pump = 0;
+  deliver_stop (e);
 }
 
 /* --- the pump ------------------------------------------------------------ */

@@ -288,6 +288,20 @@ if the caller cancels and immediately queues the next utterance — the new text
 goes into the queue behind a stop the chip has not seen yet, and is lost. This
 is what makes cancel-then-speak safe.
 
+**And it leaves the chip as if the cut-off sentence had ended.** A bare CTRL+X
+stops the audio but leaves the text translator mid-sentence: the cancelled
+sentence stays in its text window (0x08FB, upper-cased) and the next utterance
+is read as its continuation, without the sentence-initial pitch reset and phrase
+markers. "Hello there." after a cancel came back 500 samples longer and
+different throughout, at every interrupt point tried. Whether the board does
+this too is unknown. A full stop is what clears it, so when a stop actually
+interrupts something, `rc8650_stop` hands the chip a `.` and CR, lets it run 256
+samples into the silent pause that follows (the translator was measured to let
+go within the first 64), and stops again. The silence is dropped. Across three
+cut-off sentences, three follow-ups and eleven interrupt points each, 99 of 99
+follow-on utterances matched a clean one byte for byte; the stop costs about
+8 ms of host time on average and 16 ms at worst, and nothing on an idle chip.
+
 ### Sample rate
 
 `RC8650_SAMPLE_RATE` is 10017 Hz, and everything the library returns is at that

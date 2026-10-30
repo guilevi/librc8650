@@ -110,7 +110,10 @@ void rc8650_command (rc8650_t *e, const char *cmd);
 
 /* Stop speaking immediately (CTRL+X) and drop pending audio.  The stop is
  * delivered to the chip before this returns, not merely queued, so a caller
- * may write the next utterance straight afterwards. */
+ * may write the next utterance straight afterwards.  When it interrupts
+ * something it also ends the cut-off sentence for the chip's text translator,
+ * so the next utterance is spoken exactly as it would be after a clean finish;
+ * that costs about 10 ms of host time.  On an idle chip it costs nothing. */
 void rc8650_stop (rc8650_t *e);
 
 /* --- knowing when an utterance has ended --------------------------------- */
