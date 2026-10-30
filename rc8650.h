@@ -283,6 +283,77 @@ void rc8650_set_analog_input (rc8650_t *e, unsigned channel, uint8_t value);
  * runs all of them; see "Firmware images" in README.md for what differs. */
 unsigned rc8650_chip (rc8650_t *e);
 
+/* --- what the loaded firmware offers ------------------------------------- */
+
+/* Front ends that want to work with whichever firmware they are given - the
+ * five RC8650 builds RCStudio ships, the RC8660, and whatever comes later -
+ * should take the chip's settings from here rather than from a datasheet.
+ *
+ * Most of it is asked of the firmware itself, the first time it is asked for:
+ * every voice is selected and read back with the Interrogate command (12?),
+ * which gives both how many voices there are and each one's preset, and the
+ * speed and formant ranges are found the same way, by setting each value in
+ * turn until one does not stick.  The chip is then reinitialised (@), so it is
+ * left at its power-on settings.  This costs well under a million emulated
+ * instructions.  Voice names and the rate ladder are not discoverable and come
+ * from tables for the two known families; for firmware the library does not
+ * know, voices are named "Voice n" and the ladder is the default speed scale
+ * as it stands.  rc8650_reset discards the profile, and the next call probes
+ * again. */
+#define RC8650_MAX_VOICES 32
+#define RC8650_MAX_RUNGS  64
+
+typedef struct rc8650_preset
+{
+  uint8_t pitch;		/* nP */
+  uint8_t articulation;		/* nA */
+  uint8_t formant;		/* nF */
+  uint8_t tone;			/* nX */
+  uint8_t expression;		/* nE */
+  uint8_t reverb;		/* nR */
+  uint8_t word_delay;		/* nT */
+  uint8_t reserved;
+} rc8650_preset;
+
+/* One step of a speech-rate ladder: the speed scale (the Protocol Options
+ * Register's V86 bit, 0x80 or 0) and the nS value, with how many samples one
+ * fixed sentence took at it - what the ladder is sorted by, and what a caller
+ * scaling a rate by a ratio can use.  samples is 0 where it was not measured. */
+typedef struct rc8650_rung
+{
+  uint8_t v86;
+  uint8_t speed;
+  uint16_t reserved;
+  uint32_t samples;
+} rc8650_rung;
+
+typedef struct rc8650_profile
+{
+  unsigned chip;		/* 8650, 8660, or 0 if neither */
+  unsigned version;		/* firmware version, packed BCD: 0x0260 = 2.60 */
+  unsigned model;		/* the image header's model byte */
+  unsigned interrogate_len;	/* bytes in a 12? reply: 23, or 27 on the RC8660 */
+  unsigned max_index_mark;	/* as rc8650_max_index_mark */
+  unsigned voices;		/* nO runs 0..voices-1 */
+  unsigned speed_max_v86;	/* nS 0..this with V86 set */
+  unsigned speed_max_v8600;	/* nS 0..this with V86 clear */
+  unsigned formant_max;		/* nF 0..this */
+  unsigned rungs;		/* entries in rate[], slowest first */
+  unsigned rate_default;	/* index in rate[] of the power-on rate */
+  const char *voice_name[RC8650_MAX_VOICES];
+  rc8650_preset preset[RC8650_MAX_VOICES];
+  rc8650_rung rate[RC8650_MAX_RUNGS];
+} rc8650_profile;
+
+/* Fill *out.  Returns 0, or -1 if the chip did not answer. */
+int rc8650_get_profile (rc8650_t *e, rc8650_profile *out);
+
+/* The same identity fields, read straight out of a firmware image without
+ * booting it - for listing a folder of images.  srec is the S-record text (as
+ * given to rc8650_new_from_memory).  Returns 0, or -1 if the image carries no
+ * firmware header at 0xA0000.  Only chip, version and model are filled. */
+int rc8650_image_info (const void *srec, size_t len, rc8650_profile *out);
+
 /* Chip identification, as returned by the 6? command: 8 bytes into buf.
  * Returns 0 on success, -1 if the chip did not answer. */
 int rc8650_chip_id (rc8650_t *e, uint8_t buf[8]);

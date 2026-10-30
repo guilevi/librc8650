@@ -200,6 +200,8 @@ struct rc8650
   int audio_pump;		/* inside rc8650_read, so tx bytes are status */
   int index_marks;		/* caller wants nI markers captured */
   unsigned chip;		/* 8650 or 8660, from the firmware header */
+  int profiled;			/* profile below has been probed */
+  rc8650_profile profile;
   unsigned max_mark;		/* highest marker number the chip sends */
 
   rcdict_options dict;		/* pronunciation rules; profile always set */
@@ -363,6 +365,279 @@ unsigned
 rc8650_chip (rc8650_t *e)
 {
   return e ? e->chip : 0;
+}
+
+/* --- the profile ---------------------------------------------------------- */
+
+static int hexbyte (const char *p);
+
+/* Datasheet Table 7 (RC8650) and its RC8660 counterpart, which adds three. */
+static const char *const voice_names[] = {
+  "Perfect Paul", "Vader", "Big Bob", "Precise Pete", "Ricochet Randy",
+  "Biff", "Skip", "Robo Robert", "Goliath", "Alvin", "Gretchen",
+};
+
+/* The RC8650's two speed scales interleaved into one ladder, sorted by how
+   long one fixed sentence took at each rung (macos/Sources/Shared/
+   RC8650Chip.swift, re-measured 2026-08-01).  The power-on rate is (V86, 1). */
+static const rc8650_rung ladder_8650[] = {
+  {0, 0, 0, 26572}, {0, 1, 0, 24686}, {0, 2, 0, 22036}, {0, 3, 0, 20890},
+  {0, 4, 0, 18529}, {0, 5, 0, 17131}, {0x80, 0, 0, 16773}, {0, 6, 0, 16422},
+  {0, 7, 0, 15504}, {0x80, 1, 0, 15375}, {0x80, 2, 0, 14695},
+  {0x80, 3, 0, 13777}, {0, 8, 0, 13582}, {0x80, 4, 0, 13198},
+  {0, 9, 0, 12617}, {0x80, 5, 0, 12233}, {0x80, 6, 0, 9443},
+  {0x80, 7, 0, 9199}, {0x80, 8, 0, 8493}, {0x80, 9, 0, 7653},
+};
+
+/* The RC8660 on its own speed scale only, nS 0-13, with V86 set as it powers
+   up.  Its two scales are not interleaved the way the RC8650's are: clearing
+   V86 on the RC8660 does not just slow it down, it switches it into V8600
+   compatibility, where the formant setting runs 0-9 instead of 0-99 and 12?
+   answers in the RC8650's 23 bytes - flipping it per rung would change the
+   voice under the user's feet.  Lengths are of "The quick brown fox." */
+static const rc8650_rung ladder_8660[] = {
+  {0x80, 0, 0, 25180}, {0x80, 1, 0, 23727}, {0x80, 2, 0, 21219},
+  {0x80, 3, 0, 20405}, {0x80, 4, 0, 19003}, {0x80, 5, 0, 17675},
+  {0x80, 6, 0, 16359}, {0x80, 7, 0, 15624}, {0x80, 8, 0, 13393},
+  {0x80, 9, 0, 13027}, {0x80, 10, 0, 11457}, {0x80, 11, 0, 11293},
+  {0x80, 12, 0, 10335}, {0x80, 13, 0, 10042},
+};
+
+/* 12? field offsets (Table 19). */
+enum
+{ Q_FORMANT = 2, Q_PITCH = 3, Q_SPEED = 4, Q_TONE = 6, Q_EXPRESSION = 7,
+  Q_ARTICULATION = 11, Q_REVERB = 12, Q_POR = 14, Q_TEXT_DELAY = 20,
+  Q_VOICE = 21 };
+
+/* One Interrogate, returning its length.  want is the reply length once
+   known, and reading stops there; 0 reads until the chip stops sending.
+
+   The reply is not always want long, though: the RC8660 sends its four extra
+   bytes only on its own speed scale, and with V86 clear - emulating the
+   V8600 - answers in the RC8650's 23.  So once 23 have arrived the pending
+   command is written off, and a missing tail costs SERIAL_GRACE rather than
+   THINK_CAP: waiting for bytes that were never coming made one probe take 15
+   seconds of chip time. */
+static size_t
+interrogate (rc8650_t *e, uint8_t *r, size_t cap, size_t want)
+{
+  size_t n = 0, k;
+  rc8650_command (e, "12?");
+  while (n < cap && (!want || n < want))
+    {
+      if (n >= 23)
+	e->work = 0;
+      k = rc8650_read_serial (e, r + n, (want ? want : cap) - n);
+      if (!k)
+	break;
+      n += k;
+    }
+  return n;
+}
+
+/* Send nX and report whether the Interrogate field reads back n. */
+static int
+sticks (rc8650_t *e, unsigned n, char letter, int field, size_t len)
+{
+  char cmd[16];
+  uint8_t r[64];
+
+  snprintf (cmd, sizeof cmd, "%u%c", n, letter);
+  rc8650_command (e, cmd);
+  return interrogate (e, r, sizeof r, len) >= 23 && r[field] == n;
+}
+
+/* The highest n for which nX sticks.  Every range here is 0..max with no
+   holes, so this is a binary search: a formant change costs the chip about
+   29 ms, and walking the RC8660's 0-99 one value at a time was most of a
+   2.9-second probe. */
+static unsigned
+highest (rc8650_t *e, char letter, int field, size_t len, unsigned limit)
+{
+  unsigned lo = 0, hi = limit;	/* lo sticks; everything above hi does not */
+
+  while (lo < hi)
+    {
+      unsigned mid = lo + (hi - lo + 1) / 2;
+      if (sticks (e, mid, letter, field, len))
+	lo = mid;
+      else
+	hi = mid - 1;
+    }
+  return lo;
+}
+
+static int
+probe (rc8650_t *e)
+{
+  rc8650_profile *p = &e->profile;
+  uint8_t r[64];
+  size_t len;
+  unsigned v, i;
+  int por, speed;
+
+  memset (p, 0, sizeof *p);
+  p->chip = e->chip;
+  p->version = mem_get_qi (0xa0004) | mem_get_qi (0xa0005) << 8;
+  p->model = mem_get_qi (0xa0006);
+  p->max_index_mark = e->max_mark;
+
+  len = interrogate (e, r, sizeof r, 0);
+  if (len < 23)
+    return -1;
+  p->interrogate_len = len;
+  por = r[Q_POR];
+  speed = r[Q_SPEED];
+
+  for (v = 0; v < RC8650_MAX_VOICES; v++)
+    {
+      char cmd[16];
+      snprintf (cmd, sizeof cmd, "%uO", v);
+      rc8650_command (e, cmd);
+      if (interrogate (e, r, sizeof r, len) < 23 || r[Q_VOICE] != v)
+	break;
+      p->preset[v].pitch = r[Q_PITCH];
+      p->preset[v].articulation = r[Q_ARTICULATION];
+      p->preset[v].formant = r[Q_FORMANT];
+      p->preset[v].tone = r[Q_TONE];
+      p->preset[v].expression = r[Q_EXPRESSION];
+      p->preset[v].reverb = r[Q_REVERB];
+      p->preset[v].word_delay = r[Q_TEXT_DELAY];
+      p->voice_name[v] = v < sizeof voice_names / sizeof *voice_names
+	&& p->chip ? voice_names[v] : NULL;
+    }
+  p->voices = v;
+  rc8650_command (e, "0O");
+  /* Formant before the speed scales are touched: see ladder_8660. */
+  p->formant_max = highest (e, 'F', Q_FORMANT, len, 255);
+
+  /* Only V86 moves.  The other bits stay as the chip has them: on the RC8660
+     bit 4 is RTC, and with it clear commands wait for text before they take
+     effect, so nothing set here would show in 12? at all. */
+  {
+    char cmd[16];
+    snprintf (cmd, sizeof cmd, "%dG", por | 0x80);
+    rc8650_command (e, cmd);
+    p->speed_max_v86 = highest (e, 'S', Q_SPEED, len, 63);
+    snprintf (cmd, sizeof cmd, "%dG", por & ~0x80);
+    rc8650_command (e, cmd);
+    /* The V8600 scale answers in 23 bytes on every chip. */
+    p->speed_max_v8600 = highest (e, 'S', Q_SPEED, 23, 63);
+  }
+
+  /* Back to power-on settings: voice, registers and all. */
+  rc8650_command (e, "@");
+  interrogate (e, r, sizeof r, len);
+
+  if (p->chip == 8650 && p->speed_max_v86 == 9 && p->speed_max_v8600 == 9)
+    {
+      p->rungs = sizeof ladder_8650 / sizeof *ladder_8650;
+      memcpy (p->rate, ladder_8650, sizeof ladder_8650);
+    }
+  else if (p->chip == 8660 && p->speed_max_v86 == 13 && (por & 0x80))
+    {
+      p->rungs = sizeof ladder_8660 / sizeof *ladder_8660;
+      memcpy (p->rate, ladder_8660, sizeof ladder_8660);
+    }
+  if (p->rungs)
+    {
+      /* The rung the chip powers up on.  Not always the same one: models 2
+	 and 8 start on the V8600 scale at 5S, the others on V86 at 1S. */
+      for (i = 0; i < p->rungs; i++)
+	if (p->rate[i].v86 == (por & 0x80) && p->rate[i].speed == speed)
+	  p->rate_default = i;
+    }
+  else
+    {
+      /* Not measured: the scale the chip powers up on, slowest first.  Its
+	 power-on speed is what 12? reported before probing. */
+      unsigned max = (por & 0x80) ? p->speed_max_v86 : p->speed_max_v8600;
+      for (i = 0; i <= max && i < RC8650_MAX_RUNGS; i++)
+	{
+	  p->rate[i].v86 = por & 0x80;
+	  p->rate[i].speed = i;
+	}
+      p->rungs = i;
+      p->rate_default = speed < i ? speed : 0;
+    }
+
+  /* Probing left commands' bookkeeping behind; nothing is pending now. */
+  e->work = e->started = e->heard = e->dma_seen = 0;
+  e->thinking = e->since_sample = 0;
+  e->pcm_head = e->pcm_tail = 0;
+  e->samples_read = e->samples_out;
+  e->profiled = 1;
+  return 0;
+}
+
+int
+rc8650_get_profile (rc8650_t *e, rc8650_profile *out)
+{
+  if (!e || !out || !e->booted)
+    return -1;
+  if (!e->profiled && probe (e) != 0)
+    return -1;
+  *out = e->profile;
+  return 0;
+}
+
+int
+rc8650_image_info (const void *srec, size_t len, rc8650_profile *out)
+{
+  const char *t = srec;
+  size_t i = 0;
+  int got = 0;
+  uint8_t h[8];
+
+  if (!t || !out)
+    return -1;
+  memset (out, 0, sizeof *out);
+  /* The header is the first eight bytes at 0xA0000; take them from whichever
+     records cover them. */
+  while (i < len && got != 0xff)
+    {
+      size_t s = i, e;
+      int type, count, ab, j;
+      unsigned addr = 0;
+
+      while (i < len && t[i] != '\n' && t[i] != '\r')
+	i++;
+      e = i;
+      while (i < len && (t[i] == '\n' || t[i] == '\r'))
+	i++;
+      if (e - s < 10 || t[s] != 'S' || t[s + 1] < '1' || t[s + 1] > '3')
+	continue;
+      type = t[s + 1];
+      ab = type - '0' + 1;
+      count = hexbyte (t + s + 2);
+      if (count < 0)
+	continue;
+      for (j = 0; j < ab; j++)
+	addr = (addr << 8) | (unsigned) hexbyte (t + s + 4 + 2 * j);
+      for (j = 0; j < count - ab - 1; j++)
+	{
+	  unsigned a = addr + j;
+	  int b;
+	  if (a < 0xa0000 || a >= 0xa0008)
+	    continue;
+	  if (s + 4 + 2 * (ab + j) + 2 > e)
+	    break;
+	  b = hexbyte (t + s + 4 + 2 * (ab + j));
+	  if (b < 0)
+	    break;
+	  h[a - 0xa0000] = b;
+	  got |= 1 << (a - 0xa0000);
+	}
+    }
+  /* fe 0c 04 fc: the jmp.b over the header that every image begins with. */
+  if (got != 0xff || h[0] != 0xfe)
+    return -1;
+  out->version = h[4] | h[5] << 8;
+  out->model = h[6];
+  out->chip = h[7] == 0x05 ? 8660 : h[7] == 0x04 ? 8650 : 0;
+  out->max_index_mark = out->chip == 8660 ? RC8660_MAX_INDEX_MARK
+    : RC8650_MAX_INDEX_MARK;
+  return 0;
 }
 
 size_t
@@ -883,6 +1158,7 @@ boot (rc8650_t *e, char **err)
     }
   put_reg (pc, reset);
   e->booted = 1;
+  e->profiled = 0;
 
   /* Firmware header byte 7 is the family (notes.md section 3), and the
    * families differ in more than the name: the RC8660 numbers its index
