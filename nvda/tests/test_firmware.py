@@ -121,6 +121,29 @@ def one(driverDir, dylib, image):
 	check("%s: speaks (%d samples) and reports its index" % (name, fed),
 		fed > 5000 and 1 in reached, "fed %d, indexes %r" % (fed, reached))
 
+	# Every voice, through the driver's own prefix, sounds like itself. The
+	# prefix used to send 129G, which clears the RC8660's R50 bit and makes it
+	# an RC8650 - where nO wraps voices 8-10 onto 0-2, so Alvin spoke as Vader.
+	# Comparing audio rather than the prefix is what catches that.
+	por = int(prefix.split("\x01")[1].rstrip("G"))
+	check("%s: nG keeps the power-on R50 bit (%dG, power-on %d)"
+		% (name, por, driver._rc.profile.por_default),
+		por & 0x10 == driver._rc.profile.por_default & 0x10, repr(prefix))
+	heard = {}
+	for v in sorted(voices, key=int):
+		driver._voice = v
+		driver._applyPreset(v)
+		start = len(driver._player.fed)
+		before = len(done.notified)
+		driver.speak(["The quick brown fox."])
+		deadline = time.time() + 60
+		while len(done.notified) == before and time.time() < deadline:
+			time.sleep(0.05)
+		heard.setdefault(bytes(driver._player.fed[start:]), []).append(voices[v].displayName)
+	same = [names for names in heard.values() if len(names) > 1]
+	check("%s: all %d voices sound different" % (name, len(voices)),
+		not same, "identical audio: %r" % same)
+
 	driver.adoptFirmwareDefaults()
 	check("%s: adoptFirmwareDefaults starts from the voice's preset" % name,
 		driver._formant == driver._voicePresets[driver._voice][2]

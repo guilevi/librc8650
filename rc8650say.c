@@ -40,6 +40,7 @@ usage (FILE *f)
 	   "  -f FILE      firmware S-record (default: %s,\n"
 	   "               or $RC8650_FIRMWARE)\n"
 	   "  -c CMD       send <CTRL+A>CMD<CR> before speaking, e.g. -c 5S\n"
+	   "               (repeatable; sent in order)\n"
 	   "  -d FILE      load a pronunciation dictionary (repeatable)\n"
 	   "  --phonemes   allow [[K AE T]] phoneme escapes in the text\n"
 	   "  --chip-id    print the 6? chipset identification and exit\n"
@@ -156,9 +157,9 @@ play_file (const char *wav)
 int
 main (int argc, char **argv)
 {
-  const char *out_path = NULL, *fw = NULL, *precmd = NULL;
-  const char *dicts[8];
-  int ndicts = 0, inline_phonemes = 0;
+  const char *out_path = NULL, *fw = NULL;
+  const char *dicts[8], *precmds[32];
+  int ndicts = 0, nprecmds = 0, inline_phonemes = 0;
   rcdict *dict = NULL;
   int raw = 0, chip_id = 0, quiet = 0;
   char text[8192];
@@ -185,7 +186,12 @@ main (int argc, char **argv)
       else if (!strcmp (argv[i], "-f") && i + 1 < argc)
 	fw = argv[++i];
       else if (!strcmp (argv[i], "-c") && i + 1 < argc)
-	precmd = argv[++i];
+	{
+	  if (nprecmds < (int) (sizeof precmds / sizeof precmds[0]))
+	    precmds[nprecmds++] = argv[++i];
+	  else
+	    i++;
+	}
       else if (!strcmp (argv[i], "-d") && i + 1 < argc)
 	{
 	  if (ndicts < (int) (sizeof dicts / sizeof dicts[0]))
@@ -308,8 +314,8 @@ main (int argc, char **argv)
       rc8650_set_dictionary (e, dict, inline_phonemes);
     }
 
-  if (precmd)
-    rc8650_command (e, precmd);
+  for (int i = 0; i < nprecmds; i++)
+    rc8650_command (e, precmds[i]);
   rc8650_say (e, text);
 
   if (!quiet && !raw)

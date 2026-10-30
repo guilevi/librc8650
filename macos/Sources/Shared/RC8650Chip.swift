@@ -138,12 +138,37 @@ public enum RC8650Chip {
 
     // MARK: - Registers
 
-    /// Protocol Options Register (nG).  Bit 4 is not settable — 255G reads
-    /// back as 239 — so the writable mask is 0xEF.
+    /// Protocol Options Register (nG).  Bit 4 is not the user's: on the
+    /// RC8650 it is not settable — 255G reads back as 239 — and on the RC8660
+    /// it is R50, which has to stay as the chip powers up (see
+    /// `protocolOptions`).  So the writable mask is 0xEF.
     public enum POR {
         public static let statusMessages = 0x01   // STM: one byte on output start, one on stop
+        public static let r50            = 0x10   // R50 (RC8660): clear, and it emulates the RC8650
         public static let v86Rate        = 0x80   // V86: select the faster of the two rate scales
         public static let writableMask   = 0xEF
+    }
+
+    /// The nG value to send for a set of parameters at a rung of the ladder:
+    /// the user's own bits, the rung's speed scale, STM, and R50 as the chip
+    /// powered up with it.
+    ///
+    /// R50 is carried over because clearing it turns an RC8660 into an RC8650:
+    /// eight voices, so nO wraps Goliath, Alvin and Gretchen back onto Perfect
+    /// Paul, Vader and Big Bob, and formant 0-9.  Sending the RC8650's usual
+    /// 129 before every utterance did exactly that.  The RC8650 powers up with
+    /// it clear, so nothing changes there.
+    ///
+    /// STM makes the chip transmit one byte when its output starts and another
+    /// when it stops, which is what librc8650 ends an utterance on.  Re-timing
+    /// every rung of the ladder with the bit set changed 19 of the 20 by not one
+    /// sample and the twentieth by two out of 53875.
+    public static func protocolOptions(_ p: Parameters, rung: (por: Int, speed: Int)) -> Int {
+        var por = (p.por & POR.writableMask) & ~POR.v86Rate
+        por |= rung.por & POR.v86Rate
+        por |= profile.porDefault & POR.r50
+        por |= POR.statusMessages
+        return por
     }
 
     /// Punctuation Filter Register (nB, datasheet Table 8).
@@ -260,15 +285,7 @@ public enum RC8650Chip {
         var out: [String] = []
         func cmd(_ n: Int, _ letter: String) { out.append("\(ctrlA)\(n)\(letter)") }
 
-        // POR: the caller's own bits, plus the rate scale this rung needs, plus
-        // STM. STM makes the chip transmit one byte when its output starts and
-        // another when it stops, which is what librc8650 ends an utterance on.
-        // Re-timing every rung of the ladder with the bit set changed 19 of the
-        // 20 by not one sample and the twentieth by two out of 53875.
-        var por = (p.por & POR.writableMask) & ~POR.v86Rate
-        por |= rung.por & POR.v86Rate
-        por |= POR.statusMessages
-        cmd(por, "G")
+        cmd(protocolOptions(p, rung: rung), "G")
 
         cmd(p.voice, "O")
         cmd(rung.speed, "S")
@@ -324,10 +341,7 @@ public enum RC8650Chip {
 
         if next.rateRung != previous.rateRung {
             let rung = rateLadder[next.rateRung.clamped(to: 0...(rateLadder.count - 1))]
-            var por = (next.por & POR.writableMask) & ~POR.v86Rate
-            por |= rung.por & POR.v86Rate
-            por |= POR.statusMessages
-            cmd(por, "G")
+            cmd(protocolOptions(next, rung: rung), "G")
             cmd(rung.speed, "S")
         }
         if next.pitch != previous.pitch { cmd(next.pitch, "P") }

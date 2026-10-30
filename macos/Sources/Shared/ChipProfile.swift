@@ -32,6 +32,10 @@ public struct ChipProfile: Sendable {
     public let defaultRateRung: Int
     public let interrogateLength: Int
     public let maxIndexMark: Int
+    /// The Protocol Options Register as the chip powers up: 128 on the RC8650,
+    /// 144 on the RC8660, whose bit 4 (R50) is what keeps it an RC8660.  See
+    /// `RC8650Chip.protocolOptions`.
+    public let porDefault: Int
 
     /// "RC8650", "RC8660" — what the voices are called after.
     public var chipName: String { chip == 0 ? "RC86x0" : "RC\(chip)" }
@@ -73,12 +77,13 @@ public struct ChipProfile: Sendable {
             14695, 13777, 13582, 13198, 12617,
             12233, 9443, 9199, 8493, 7653,
         ],
-        defaultRateRung: 9, interrogateLength: 23, maxIndexMark: 99)
+        defaultRateRung: 9, interrogateLength: 23, maxIndexMark: 99, porDefault: 128)
 
     public init(chip: Int, version: String, model: Int, voices: [RC8650Chip.Voice],
                 formantRange: ClosedRange<Int>, speedRange: ClosedRange<Int>,
                 rateLadder: [(por: Int, speed: Int)], rateDuration: [Int],
-                defaultRateRung: Int, interrogateLength: Int, maxIndexMark: Int) {
+                defaultRateRung: Int, interrogateLength: Int, maxIndexMark: Int,
+                porDefault: Int) {
         self.chip = chip
         self.version = version
         self.model = model
@@ -90,6 +95,7 @@ public struct ChipProfile: Sendable {
         self.defaultRateRung = defaultRateRung
         self.interrogateLength = interrogateLength
         self.maxIndexMark = maxIndexMark
+        self.porDefault = porDefault
     }
 
     /// From librc8650's own description of the firmware it is running.
@@ -140,6 +146,7 @@ public struct ChipProfile: Sendable {
         speedRange = 0...Int(max(p.speed_max_v86, p.speed_max_v8600))
         interrogateLength = Int(p.interrogate_len)
         maxIndexMark = Int(p.max_index_mark)
+        porDefault = Int(p.por_default)
     }
 
     static func versionString(_ bcd: UInt32) -> String {

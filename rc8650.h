@@ -299,7 +299,15 @@ unsigned rc8650_chip (rc8650_t *e);
  * from tables for the two known families; for firmware the library does not
  * know, voices are named "Voice n" and the ladder is the default speed scale
  * as it stands.  rc8650_reset discards the profile, and the next call probes
- * again. */
+ * again.
+ *
+ * A front end that sends nG should build it from por_default, changing only
+ * the bits it means to: (por_default & ~0x80) | rung.v86, plus STM if wanted.
+ * Bits a front end does not know about matter.  The RC8660 powers up at 144G,
+ * and its bit 4 (R50) is what keeps it an RC8660: with it clear the chip
+ * emulates the RC8650 - eight voices, so nO wraps 8-10 back onto 0-2, and
+ * formant 0-9.  The RC8650 cannot set that bit at all, so carrying it is
+ * harmless there. */
 #define RC8650_MAX_VOICES 32
 #define RC8650_MAX_RUNGS  64
 
@@ -340,6 +348,7 @@ typedef struct rc8650_profile
   unsigned formant_max;		/* nF 0..this */
   unsigned rungs;		/* entries in rate[], slowest first */
   unsigned rate_default;	/* index in rate[] of the power-on rate */
+  unsigned por_default;		/* the Protocol Options Register at power-on */
   const char *voice_name[RC8650_MAX_VOICES];
   rc8650_preset preset[RC8650_MAX_VOICES];
   rc8650_rung rate[RC8650_MAX_RUNGS];

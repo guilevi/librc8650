@@ -479,8 +479,8 @@ with `12?`, binary-searches the speed and formant ranges the same way, and then
 reinitialises the chip (`@`) - 85-150 ms of host time, once per engine. Voice
 names and the rate ladder, which cannot be asked for, come from tables for the
 two known families; unknown firmware gets "Voice n" and its power-on speed scale.
-On the RC8660 only the V86 bit is touched while probing: its bit 4 is RTC, and
-with it clear commands wait for text before they show in `12?`. Its two speed
+On the RC8660 only the V86 bit is touched while probing: its bit 4 is R50
+(datasheet Table 19), and with it clear the chip emulates the RC8650. Its two speed
 scales are not interleaved into one ladder the way the RC8650's are, because
 clearing V86 on the RC8660 switches it into V8600 compatibility, where formant
 runs 0-9 and `12?` is 23 bytes.
@@ -523,6 +523,7 @@ firmware v3.44):
 | Feature | Status |
 |---|---|
 | Voices `0O`-`10O` (RC8650: 0-7) | all eleven speak, each distinct |
+| Protocol Options `nG` | powers up at `144G`: V86 and bit 4, R50. Clear R50 - `129G` (V86 + STM, the RC8650's usual value) does - and the chip emulates the RC8650: `nO` wraps voices 8-10 onto 0-2, formant runs 0-9 and `12?` is 23 bytes. Both front ends sent `129G` before every utterance until this was found; they now build `nG` from `rc8650_profile.por_default` |
 | Speed `0S`-`13S` (RC8650: 0-9) | monotonic, 25,180 down to 10,042 samples for one sentence |
 | Formant `0F`-`99F` (RC8650: 0-9) | the sample clock again, seven f1 cycles a step: 1,087 cycles (6.8 kHz) at `0F`, 737 at `50F`, 394 (18.7 kHz) at `99F`. Above the 10 kHz output rate the library now averages rather than interpolates, and its floor on a believable period dropped from 512 cycles (which had silently pinned everything above about `84F` to the default) to 64 |
 | Index markers `0I`-`255I` (RC8650: 0-99) | captured to 255 when the firmware is an RC8660; `rc8650_max_index_mark()` says which. With status messages on, markers 66, 69, 101, 102, 115 and 116 are consumed as status |

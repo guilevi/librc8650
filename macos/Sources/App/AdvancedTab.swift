@@ -20,7 +20,9 @@ struct AdvancedTab: View {
                 Text("Protocol Options Register — nG")
                     .font(.headline)
                 Text("""
-                     Bit 4 is not writable: sending 255G reads back as 239. Bit 7 is not \
+                     Bit 4 is the chip's: the RC8650 cannot set it (255G reads back as \
+                     239), and on the RC8660 it is R50, which is sent as the chip powers \
+                     up — clear, the RC8660 becomes an RC8650 with eight voices. Bit 7 is not \
                      yours to set here either — the rate ladder on the Voice tab owns it, \
                      since it is what selects which of the chip's two speed scales nS \
                      indexes into. Bit 0 is forced on, because the status messages it \
@@ -107,10 +109,7 @@ struct AdvancedTab: View {
 
     private var effectivePOR: Int {
         let rung = RC8650Chip.rateLadder[min(model.parameters.rateRung, RC8650Chip.rateLadder.count - 1)]
-        var por = (model.parameters.por & RC8650Chip.POR.writableMask) & ~RC8650Chip.POR.v86Rate
-        por |= rung.por & RC8650Chip.POR.v86Rate
-        por |= RC8650Chip.POR.statusMessages
-        return por
+        return RC8650Chip.protocolOptions(model.parameters, rung: rung)
     }
 
     private var prefixDisplay: String {

@@ -487,6 +487,7 @@ probe (rc8650_t *e)
     return -1;
   p->interrogate_len = len;
   por = r[Q_POR];
+  p->por_default = por;
   speed = r[Q_SPEED];
 
   for (v = 0; v < RC8650_MAX_VOICES; v++)
@@ -512,8 +513,8 @@ probe (rc8650_t *e)
   p->formant_max = highest (e, 'F', Q_FORMANT, len, 255);
 
   /* Only V86 moves.  The other bits stay as the chip has them: on the RC8660
-     bit 4 is RTC, and with it clear commands wait for text before they take
-     effect, so nothing set here would show in 12? at all. */
+     bit 4 is R50, and with it clear the chip emulates the RC8650, so what was
+     measured would be the RC8650's ranges rather than its own. */
   {
     char cmd[16];
     snprintf (cmd, sizeof cmd, "%dG", por | 0x80);

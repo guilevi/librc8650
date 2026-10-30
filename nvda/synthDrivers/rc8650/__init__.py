@@ -140,12 +140,12 @@ class _Rc8650Rung(ctypes.Structure):
 
 class _Rc8650Profile(ctypes.Structure):
 	# rc8650.h's rc8650_profile. Natural alignment throughout, which is what
-	# ctypes and both mingw targets agree on: eleven unsigned ints, then the
+	# ctypes and both mingw targets agree on: twelve unsigned ints, then the
 	# pointer array (padded to 8 on 64-bit), then two arrays of 8-byte structs.
 	_fields_ = [(name, ctypes.c_uint) for name in (
 		"chip", "version", "model", "interrogate_len", "max_index_mark",
 		"voices", "speed_max_v86", "speed_max_v8600", "formant_max", "rungs",
-		"rate_default")] + [
+		"rate_default", "por_default")] + [
 		("voice_name", ctypes.c_char_p * 32),
 		("preset", _Rc8650Preset * 32),
 		("rate", _Rc8650Rung * 64),
@@ -401,6 +401,14 @@ class SynthDriver(SynthDriver):
 	# sample, and the twentieth by two out of 53875.
 	_STM = 1
 
+	# POR bit 4 (R50) on the RC8660, where it powers up set (144G). Clear, the
+	# RC8660 emulates the RC8650: eight voices, so nO wraps Goliath, Alvin and
+	# Gretchen back onto Perfect Paul, Vader and Big Bob, and formant 0-9.
+	# Every nG is sent with it as the chip powered up - see _por. The RC8650
+	# cannot set it and powers up with it clear.
+	_R50 = 0x10
+	_porKeep = 0
+
 	# nX tone, Table 8.
 	_tones = {
 		"0": StringParameterInfo("0", "Bass"),
@@ -461,6 +469,7 @@ class SynthDriver(SynthDriver):
 		# RC8660's fourteen. A rung is pct // step - 1.
 		self._rateStep = max(1, 100 // max(1, p.rungs))
 		self._RATE_DEFAULT = (p.rate_default + 1) * self._rateStep
+		self._porKeep = p.por_default & self._R50
 		self._settings = self._buildSettings()
 		#: 8650 or 8660, so the settings panel can tell a change of chip from a
 		#: change of revision when the firmware is switched.
@@ -954,7 +963,7 @@ class SynthDriver(SynthDriver):
 		# - interrogating the chip after an nO shows POR untouched. nS still
 		# lands after both, which is what actually matters, because the
 		# register selects the speed scale that nS then indexes into.
-		parts = ["\x01%dG" % (por | self._STM)]
+		parts = ["\x01%dG" % self._por(por)]
 		parts.append("\x01%sO" % voice)
 		parts.append("\x01%dS" % speed)
 		parts.append("\x01%dV" % self._map0to9(self._volume))
@@ -977,6 +986,11 @@ class SynthDriver(SynthDriver):
 			parts.append("\x01%dT" % self._worddelay)
 		return "".join(parts)
 
+	def _por(self, rung):
+		# The nG value for a rung's speed scale: STM, and R50 as the chip
+		# powered up with it.
+		return rung | self._STM | self._porKeep
+
 	def _prosody(self, command):
 		# NVDA's prosody commands are relative to the current setting and are
 		# always followed by a reset (offset 0), e.g. pitch up for a capital
@@ -997,7 +1011,7 @@ class SynthDriver(SynthDriver):
 			# Keep STM set: this rewrites the whole register, and dropping the
 			# bit mid-utterance would silence the end-of-output message the
 			# library is waiting for.
-			return "\x01%dG\x01%dS" % (por | self._STM, speed)
+			return "\x01%dG\x01%dS" % (self._por(por), speed)
 		return ""
 
 	def _expand(self, text):
