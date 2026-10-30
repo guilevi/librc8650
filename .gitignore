@@ -29,3 +29,8 @@ nvda/synthDrivers/rc8650/*.dll
 # macOS
 .DS_Store
 rcdict/build/
+
+# The macOS app: the universal library build-lib.sh makes, and the Xcode
+# project xcodegen generates from project.yml.
+macos/lib/
+macos/RC8650.xcodeproj/

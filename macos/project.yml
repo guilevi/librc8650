@@ -1,0 +1,86 @@
+name: RC8650
+options:
+  bundleIdPrefix: com.guilevi
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0"
+  minimumXcodeGenVersion: "2.35"
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+    # The App Group the app and its extension share.
+    #
+    # macOS refuses to load an app extension that is not sandboxed ("plug-ins
+    # must be sandboxed", from pkd), and a sandboxed extension cannot see
+    # ~/Library/Application Support — so the settings the app edits and the
+    # firmware image it installs live in a group container instead, and both
+    # sides need this in their entitlements to reach it.
+    #
+    # It is a build setting because the team identifier in it is not portable:
+    # change these two together to build this under a different account.
+    RC8650_APP_GROUP: EC7L97XK6C.com.guilevi.rc8650
+    DEVELOPMENT_TEAM: EC7L97XK6C
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: Apple Development
+    CODE_SIGNING_REQUIRED: "YES"
+    CODE_SIGNING_ALLOWED: "YES"
+    ENABLE_HARDENED_RUNTIME: "NO"
+
+    # librc8650 and its module map.  The header the module map points at is the
+    # one in librc8650 itself, so the Swift declarations cannot drift from the
+    # library being linked.
+    SWIFT_INCLUDE_PATHS: $(SRCROOT)/CRC8650
+    LIBRARY_SEARCH_PATHS: $(SRCROOT)/lib
+    OTHER_LDFLAGS: -lrc8650 -lm
+    DEAD_CODE_STRIPPING: "YES"
+  configs:
+    Release:
+      # build-lib.sh makes librc8650.a universal, so the app can be too.
+      ARCHS: arm64 x86_64
+      ONLY_ACTIVE_ARCH: "NO"
+
+targets:
+  RC8650:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/App
+      - path: Sources/Shared
+      - path: CRC8650
+        buildPhase: none
+    dependencies:
+      - target: RC8650Voices
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.guilevi.rc8650
+        PRODUCT_NAME: RC8650
+        INFOPLIST_FILE: Sources/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/App/RC8650.entitlements
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        COMBINE_HIDPI_IMAGES: "YES"
+
+  RC8650Voices:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Sources/Extension
+      - path: Sources/Shared
+      - path: CRC8650
+        buildPhase: none
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.guilevi.rc8650.voices
+        PRODUCT_NAME: RC8650Voices
+        INFOPLIST_FILE: Sources/Extension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/Extension/RC8650Voices.entitlements
+        SKIP_INSTALL: "YES"

@@ -62,6 +62,7 @@ defs.h  ansidecl.h     shims for two headers a GDB build tree would generate
 sim/                   the patch that turns stock gdb-14.2/sim/m32c into the core
 win-compat/            what a Windows host lacks, for the mingw-w64 cross build
 nvda/                  the NVDA add-on, built on the two DLLs
+macos/                 the macOS system voice (speech synthesis extension + app)
 ```
 
 ## CLI

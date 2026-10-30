@@ -1,0 +1,12 @@
+// Makes librc8650's C API importable from Swift as `import CRC8650`.
+// rc8650.h is not copied: it is the library's own, two levels up, so the Swift side
+// can never drift from the library it links against.
+// rcdict.h comes in too, for the pronunciation dictionary: rc8650.h declares
+// only rc8650_set_dictionary and rc8650_expand, and building the dictionary to
+// hand them is rcdict's own API.
+module CRC8650 {
+    header "../../rc8650.h"
+    header "../../rcdict/rcdict.h"
+    header "rc8650_shim.h"
+    export *
+}
