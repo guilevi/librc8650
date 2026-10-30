@@ -450,6 +450,62 @@ do not:
   minute - with A1's interrupt enabled. It is most likely behind the sleep or
   timeout features; nothing measured so far depends on it.
 
+## Firmware images: the RC8650 builds and the RC8660
+
+RC Systems' RCStudio ships six firmware sets, each a firmware container and a
+BIOS container in `RCStudio/Bin` (the format, the XOR obfuscation and the
+pairing are in the reverse-engineering notes, sections 2 and 3). The notes'
+`mksrec.py` turns any pair into a loadable S-record: `-m 1`, `2`, `4`, `7`, `8`
+or `8660`. All six boot, answer `6?` and `12?`, and speak.
+
+| `-m` | Containers | Firmware | `6?` | Factory defaults | Status |
+|---|---|---|---|---|---|
+| 1 | `m$195a22` + `m$11f9aa` | RC8650 v2.60 | `37 0e 01 04 27 02 60 02` | as model 4 | speech byte-identical to model 4 |
+| 2 | `m$28a5f8` + `m$2a11b2` | RC8650 v2.60 | `… 02 04 … 60 02` | `5S`, POR `00` (V8600 speed scale) | identical to model 4 given `0G` `5S` |
+| 4 | `m$4a95b2` + `m$4f8c6a` | RC8650 v2.60 | `… 04 04 … 60 02` | `1S`, POR `80` | the reference image, `rc8650_m4_valid.srec` |
+| 7 | `m$4b39ca` + `m$4f92e7` | RC8650 v2.60 | `… 07 04 … 60 02` | as model 4 | speech byte-identical to model 4 |
+| 8 | `m$29c1d3` + `m$2b71e1` | RC8650 v2.60 | `… 08 04 … 60 02` | as model 2 | speech byte-identical to model 2 |
+| 8660 | `m$1a6c3f` + `m$12a73d` | **RC8660 v3.44** | `… 01 05 … 44 03` | `5S`, `50F`, POR `90` | see below |
+
+What the model byte denotes physically is still open (notes, section 3); what it
+changes in the firmware, as far as the emulation shows, is the factory
+defaults. Models 2 and 8 differ from 1, 4 and 7 only in starting on the V8600
+speed scale at rate 5: model 4 told `0G` and `5S` then speaks exactly as model 2
+does out of the box, from the third sample on (the first two are the D/A's
+boot-time level).
+
+`rc8650_chip()` reports which family the loaded firmware is for, read from the
+image header (byte 7, `0x04` or `0x05`).
+
+### The RC8660
+
+The RC8660 is the RC8650's successor: the same M16C, the same 7.3728 MHz
+crystal, the same 10 kHz speech rate, the same DoubleTalk engine and voice
+data, with a larger RAM, a larger command set and an on-chip recording file
+system. Its firmware ran in the emulation only after **simulator bug #7** was
+fixed: bit operands were masked as if they were byte addresses, so any at or
+above byte `0x2000` wrapped. The RC8650 keeps its variables at `0x123E` and
+never noticed; the RC8660 keeps them at `0x2A14`, so its "playback running"
+flag landed on the wrong byte, the synthesizer lapped the sample ring and
+"Hello there." stopped 1,690 samples in. With that fixed, its "Hello there."
+at factory defaults is byte for byte model 2's.
+
+Measured on the emulated RC8660 against its datasheet (User's Manual rev 11,
+firmware v3.44):
+
+| Feature | Status |
+|---|---|
+| Voices `0O`-`10O` (RC8650: 0-7) | all eleven speak, each distinct |
+| Speed `0S`-`13S` (RC8650: 0-9) | monotonic, 25,180 down to 10,042 samples for one sentence |
+| Formant `0F`-`99F` (RC8650: 0-9) | the sample clock again, seven f1 cycles a step: 1,087 cycles (6.8 kHz) at `0F`, 737 at `50F`, 394 (18.7 kHz) at `99F`. Above the 10 kHz output rate the library now averages rather than interpolates, and its floor on a believable period dropped from 512 cycles (which had silently pinned everything above about `84F` to the default) to 64 |
+| Index markers `0I`-`255I` (RC8650: 0-99) | captured to 255 when the firmware is an RC8660; `rc8650_max_index_mark()` says which. With status messages on, markers 66, 69, 101, 102, 115 and 116 are consumed as status |
+| `12?` | 27 bytes: the RC8650's 23, then free recording memory (16 bits, `FF FF` = -1, "RC8650 library present") and the number of files (16 bits) |
+| Sinusoidal generator `nJaaaabbbb` | plays; `n` is the duration in 10 ms steps and `aaaa`/`bbbb` the two frequencies in Hz. The RC8650's `nJ` + three bytes form produces nothing, as the datasheet implies |
+| Suspend / resume (CTRL+P, CTRL+R) | work. While suspended, `rc8650_read` reports the utterance done; writing CTRL+R re-arms it, and the rest arrives - 30,988 samples in all against 30,990 uninterrupted |
+| Skip (CTRL+Y) | works, on both chips: the sentence in progress ends and the next CR-terminated one plays |
+| A/D converter, DTMF, real-time PCM, musical generator | as on the RC8650 |
+| **Recording memory** - record (`nL`), upload (`245L`), erase (`234L`), initialise (`214W`), repair (`218W`), download (`236W`, `223W`), data logging | **not emulated.** All of it lives in the external flash, and the emulation models only that chip's ID query: programs and erases are ignored, and `214W` sends no result code at all. The firmware erases through command cycles at `0xFFAAA`/`0xFF554` inside the CPU's `0x80000`-`0xFFFFF` window - the same 8 MB part that holds the firmware at flash `0x7A0000`, the window showing its top 512 KB - and switches banks through port 7 bits 3-5 (`0x80`, `0xA0`, `0xB0`, `0xB8` around an erase). Emulating it means the whole part: the array, the banking, program and erase, and status polling |
+
 ## Licensing — read before shipping
 
 The emulator core is GPL-3.0-or-later (it derives from GDB's `sim/m32c`), so

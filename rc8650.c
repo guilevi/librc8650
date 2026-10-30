@@ -115,11 +115,16 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
    speech at the default 5F and for the tone and DTMF generators, which divides
    by 737.  At that period the resampler passes samples through untouched.
 
+   The RC8660 goes much further: its formant setting runs 0F-99F, seven
+   cycles a step, from 1087 cycles (6.8 kHz) to 394 (18.7 kHz).  Above the
+   output rate - any period below NOMINAL_PERIOD - hook_dac averages instead
+   of interpolating; see there.
+
    MIN_PERIOD catches the moment before the firmware has programmed TA3 at
-   all, when it reads 0: nothing the chip does runs faster than 11 kHz, which
-   is 670 cycles. */
+   all, when it reads 0.  It used to be 512, from the RC8650's fastest rate,
+   and that silently discarded the RC8660's real periods above about 84F. */
 #define NOMINAL_PERIOD 737
-#define MIN_PERIOD     512
+#define MIN_PERIOD      64
 
 /* How long rc8650_read_serial keeps the CPU running for a reply that may still
  * be draining after the audio side has gone idle.  See rc8650_read_serial. */
@@ -194,6 +199,8 @@ struct rc8650
   int talking;			/* a start message has arrived, no stop yet */
   int audio_pump;		/* inside rc8650_read, so tx bytes are status */
   int index_marks;		/* caller wants nI markers captured */
+  unsigned chip;		/* 8650 or 8660, from the firmware header */
+  unsigned max_mark;		/* highest marker number the chip sends */
 
   rcdict_options dict;		/* pronunciation rules; profile always set */
 
@@ -212,6 +219,8 @@ struct rc8650
   int rs_have;			/* a D/A sample is held in rs_prev */
   unsigned char rs_prev;	/* the last D/A sample */
   long rs_acc;			/* f1 cycles from rs_prev to the next output */
+  long ds_fill;			/* f1 cycles of the output sample filled so far */
+  double ds_acc;		/* level x cycles in that output sample */
 
   unsigned lowpass_hz;		/* 0 = bypass */
   double b0, b1, b2, a1, a2;	/* biquad coefficients */
@@ -342,6 +351,18 @@ mark_put (rc8650_t *e, unsigned char value)
   e->mark[e->mark_head].value = value;
   e->mark[e->mark_head].reserved = 0;
   e->mark_head = next;
+}
+
+unsigned
+rc8650_max_index_mark (rc8650_t *e)
+{
+  return e ? e->max_mark : RC8650_MAX_INDEX_MARK;
+}
+
+unsigned
+rc8650_chip (rc8650_t *e)
+{
+  return e ? e->chip : 0;
 }
 
 size_t
@@ -500,7 +521,7 @@ hook_tx (unsigned char b)
      marker arrived in the silence between the previous sentence's last sample
      and its own first one - up to 137 ms ahead of the word it marks, never
      behind it. */
-  if (e->index_marks && e->audio_pump && b <= RC8650_MAX_INDEX_MARK)
+  if (e->index_marks && e->audio_pump && b <= e->max_mark)
     {
       mark_put (e, b);
       return;
@@ -593,13 +614,54 @@ hook_dac (unsigned char v)
      that lands exactly on a D/A sample gets that sample, so at the nominal
      period - all speech at 5F, and the tone and DTMF generators - this is a
      straight copy.  It also never waits for a sample that has not arrived,
-     which would hold the last one of every utterance back. */
+     which would hold the last one of every utterance back.
+
+     When the D/A runs faster than the output - a period below
+     NOMINAL_PERIOD, which the RC8660's upper formant settings reach at up to
+     1.9 times the output rate - interpolating would alias everything above
+     5 kHz back down into the band.  So there each output sample is instead
+     the D/A's level averaged over its period, each D/A sample held for the
+     period programmed when it was written: the same box the code-driven
+     path uses. */
   {
     long p = m32c_rc865x_dac_period ();
 
     if (p < MIN_PERIOD)
       p = NOMINAL_PERIOD;
-    if (!e->rs_have)
+    if (p < NOMINAL_PERIOD && e->rs_have)
+      {
+	long left = p, take;
+
+	while (left > 0)
+	  {
+	    take = NOMINAL_PERIOD - e->ds_fill;
+	    if (take > left)
+	      take = left;
+	    e->ds_acc += v * (double) take;
+	    e->ds_fill += take;
+	    left -= take;
+	    if (e->ds_fill == NOMINAL_PERIOD)
+	      {
+		dac_out (e, (unsigned char) lround (e->ds_acc / NOMINAL_PERIOD));
+		e->ds_acc = 0;
+		e->ds_fill = 0;
+	      }
+	  }
+	/* Should the period rise again, interpolation resumes at the next
+	   sample, as if this one had landed on an output instant. */
+	e->rs_acc = NOMINAL_PERIOD;
+      }
+    else if (e->ds_fill)
+      {
+	/* Back from averaging: close the output sample in progress with
+	   this level, then carry on interpolating from here. */
+	e->ds_acc += v * (double) (NOMINAL_PERIOD - e->ds_fill);
+	dac_out (e, (unsigned char) lround (e->ds_acc / NOMINAL_PERIOD));
+	e->ds_acc = 0;
+	e->ds_fill = 0;
+	e->rs_acc = NOMINAL_PERIOD;
+      }
+    else if (!e->rs_have)
       {
 	dac_out (e, v);
 	e->rs_have = 1;
@@ -821,12 +883,33 @@ boot (rc8650_t *e, char **err)
     }
   put_reg (pc, reset);
   e->booted = 1;
+
+  /* Firmware header byte 7 is the family (notes.md section 3), and the
+   * families differ in more than the name: the RC8660 numbers its index
+   * markers to 255. */
+  switch (mem_get_qi (0xa0007))
+    {
+    case 0x05:
+      e->chip = 8660;
+      e->max_mark = RC8660_MAX_INDEX_MARK;
+      break;
+    case 0x04:
+      e->chip = 8650;
+      e->max_mark = RC8650_MAX_INDEX_MARK;
+      break;
+    default:
+      e->chip = 0;
+      e->max_mark = RC8650_MAX_INDEX_MARK;
+      break;
+    }
   e->since_sample = 0;
   e->thinking = 0;
   e->work = e->started = e->talking = e->heard = e->dma_seen = 0;
   e->mark_head = e->mark_tail = 0;
   e->samples_out = e->samples_read = 0;
   e->rs_have = e->cd_active = e->cd_run = 0;
+  e->ds_fill = 0;
+  e->ds_acc = 0;
 
   /* Run the BIOS and firmware init through to the point where the chip
    * asserts CTS#, so callers get a device that is ready to be spoken to. */
@@ -1124,6 +1207,8 @@ deliver_stop (rc8650_t *e)
   e->samples_read = e->samples_out;
   e->pcm_head = e->pcm_tail = 0;
   e->rs_have = e->cd_active = e->cd_run = 0;
+  e->ds_fill = 0;
+  e->ds_acc = 0;
   /* Whatever the filter was ringing on has just been dropped; carrying its
      state into the next utterance would start it with a click. */
   biquad_reset (e);

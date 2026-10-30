@@ -195,18 +195,24 @@ size_t rc8650_read_serial (rc8650_t *e, void *buf, size_t len);
  *
  * Only useful with a caller that opts in, because capturing markers means
  * deciding that a byte is a marker rather than data - see
- * rc8650_set_index_marks. */
+ * rc8650_set_index_marks.
+ *
+ * The RC8650 numbers markers 0..99, the RC8660 0..255; rc8650_max_index_mark
+ * says which the loaded firmware does.  RC8650_MAX_INDEX_MARK is the RC8650's
+ * and stays as it was. */
 #define RC8650_MAX_INDEX_MARK 99
+#define RC8660_MAX_INDEX_MARK 255
 
 typedef struct rc8650_index_mark
 {
   uint64_t sample_pos;		/* samples produced before the marker */
-  uint32_t value;		/* marker number, 0..RC8650_MAX_INDEX_MARK */
+  uint32_t value;		/* marker number, 0..rc8650_max_index_mark() */
   uint32_t reserved;
 } rc8650_index_mark;
 
-/* Capture index markers.  Off by default; when on, a byte in 0..99 that the
- * chip transmits while rc8650_read is pumping audio is taken to be a marker,
+/* Capture index markers.  Off by default; when on, a byte in the chip's
+ * marker range (0..99 on the RC8650, 0..255 on the RC8660) that the chip
+ * transmits while rc8650_read is pumping audio is taken to be a marker,
  * timestamped, and kept out of rc8650_read_serial's stream.
  *
  * The two conditions are what make that safe.  Restricting it to the audio
@@ -221,8 +227,15 @@ typedef struct rc8650_index_mark
  * - so those two bytes are consumed as status before they ever reach the
  * marker test, whichever scale is in force.  Nothing else collides: the other
  * status bytes ('e', 'f', 's', 't', 'p', 'l') are all above 99.  Verified by
- * sending both numbers under either scale and getting no marker back. */
+ * sending both numbers under either scale and getting no marker back.
+ *
+ * On the RC8660, whose markers run to 255, all six Table 3 messages fall
+ * inside the range: with status messages on, markers 66, 69, 101, 102, 115
+ * and 116 ('B', 'E', 'e', 'f', 's', 't') are consumed as status.  The standby
+ * and baud-lock confirmations ('S', 'p', 'L', 'l') are sent whatever STM says,
+ * but not while the chip is speaking, so they do not meet the marker test. */
 void rc8650_set_index_marks (rc8650_t *e, int on);
+unsigned rc8650_max_index_mark (rc8650_t *e);
 
 /* Markers the chip has reached, oldest first.  Returns how many were copied.
  * Never runs the CPU: it drains what the last rc8650_read produced, so it is
@@ -263,6 +276,12 @@ enum
 void rc8650_set_analog_input (rc8650_t *e, unsigned channel, uint8_t value);
 
 /* --- misc --------------------------------------------------------------- */
+
+/* Which chip the loaded firmware is for: 8650 or 8660, from the family byte
+ * of its image header (0x04 or 0x05), or 0 if it is neither.  The RCStudio
+ * images are five RC8650 v2.60 builds and one RC8660 v3.44, and the library
+ * runs all of them; see "Firmware images" in README.md for what differs. */
+unsigned rc8650_chip (rc8650_t *e);
 
 /* Chip identification, as returned by the 6? command: 8 bytes into buf.
  * Returns 0 on success, -1 if the chip did not answer. */
