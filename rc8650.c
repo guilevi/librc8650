@@ -24,7 +24,11 @@
 extern void update_timer_b2 (void);
 extern void m32c_set_cpu (int cpu);
 extern void mem_put_blk (int address, const void *bufptr, int nbytes);
-extern int m32c_baremetal, m32c_rc865x, m32c_p8_or, m32c_extflash_armed;
+extern void init_mem (void);
+extern void init_regs (void);
+extern void m32c_rc865x_reset (void);
+extern int m32c_baremetal, m32c_rc865x, m32c_p8_or, m32c_p7_or;
+extern int m32c_extflash_armed;
 extern int (*rc865x_hook_rx) (unsigned char *);
 extern void (*rc865x_hook_tx) (unsigned char);
 extern void (*rc865x_hook_dac) (unsigned char);
@@ -170,6 +174,7 @@ struct rc8650
   unsigned long thinking;	/* instructions since input was handed over */
   int work;			/* something queued that has not been spoken */
   int started;			/* TS has been seen asserted for this work */
+  int dma_seen;			/* DMA0 has run for this work */
   unsigned long heard;		/* samples produced for this work */
   int booted;
 
@@ -692,12 +697,22 @@ boot (rc8650_t *e, char **err)
 
   m32c_set_cpu (CPU_M16C);	/* the -m m16c mode of the standalone sim */
 
+  /* A cold boot, every time.  Memory, registers and the peripheral models all
+   * outlive a reload of the image, and the firmware relies on power-on state:
+   * left as the last session had them, the first utterance after
+   * rc8650_reset lost its opening 558 samples. */
+  init_mem ();
+  init_regs ();
+  m32c_rc865x_reset ();
+
   /* The board configuration established in notes.md: bare-metal memory (no
-   * newlib syscall traps), the RC865x peripheral set, and port 8 bit 4 tied
-   * high for the companion-chip handshake. */
+   * newlib syscall traps), the RC865x peripheral set, port 8 bit 4 tied high
+   * for the companion-chip handshake, and SUSP0# (P7.7) tied high as the
+   * datasheet asks of an unused one - low, it means "suspend audio output". */
   m32c_baremetal = 1;
   m32c_rc865x = 1;
   m32c_p8_or = 0x10;
+  m32c_p7_or = 0x80;
   trace = verbose = enable_counting = 0;
 
   m32c_extflash_armed = 0;
@@ -720,7 +735,7 @@ boot (rc8650_t *e, char **err)
   e->booted = 1;
   e->since_sample = 0;
   e->thinking = 0;
-  e->work = e->started = e->talking = e->heard = 0;
+  e->work = e->started = e->talking = e->heard = e->dma_seen = 0;
   e->mark_head = e->mark_tail = 0;
   e->samples_out = e->samples_read = 0;
   e->rs_have = 0;
@@ -887,7 +902,7 @@ rc8650_write (rc8650_t *e, const void *data, size_t len)
     if (!in_put (e, p[i]))
       break;			/* out of memory: nothing better to do */
   e->work = 1;
-  e->started = e->heard = 0;
+  e->started = e->heard = e->dma_seen = 0;
   e->thinking = 0;
 }
 
@@ -1010,7 +1025,7 @@ rc8650_stop (rc8650_t *e)
 	}
     }
 
-  e->work = e->started = e->talking = e->heard = 0;
+  e->work = e->started = e->talking = e->heard = e->dma_seen = 0;
   e->since_sample = e->thinking = 0;
   /* The audio being dropped here was counted as produced, and the markers
      pointing into it are now meaningless.  Drop them and close the gap, so
@@ -1109,10 +1124,8 @@ step_and_track (rc8650_t *e)
 	{
 	  e->thinking = 0;
 	  /* Stuck asserted with nothing coming out: a forced-high pin never
-	     falls at all.  (The musical tone generator also leaves TS high, but
-	     it never gets past HEARD_ENOUGH, so it is the idle budget below that
-	     ends it.)  This costs nothing during real output, where the D/A is
-	     written on every sample-clock tick without exception. */
+	     falls at all.  This costs nothing during real output, where the D/A
+	     is written on every sample-clock tick without exception. */
 	  if (e->since_sample > QUIET_INSNS)
 	    e->work = 0;
 	  return;
@@ -1140,10 +1153,10 @@ step_and_track (rc8650_t *e)
   /* Nothing out and nothing taken in for THINK_CAP: the chip has finished
      with this work, or will not finish it.  This must not wait for the input
      queue to drain.  After the musical tone generator's Quit frame the chip
-     holds CTS# high until it has played the buffer, and the emulation never
-     plays it (128 samples, see notes.md), so bytes stay queued, TS stays high,
-     fewer than HEARD_ENOUGH samples ever arrive, and with the queue as a
-     condition every rule here was blocked: rc8650_read never returned.
+     holds CTS# high until it has played the buffer, and while SUSP0# was left
+     low the emulation never played it: bytes stayed queued, TS stayed high,
+     fewer than HEARD_ENOUGH samples arrived, and with the queue as a condition
+     every rule here was blocked - rc8650_read never returned.
      hook_rx counts a byte taken as progress, so a chip that is reading its
      input is never given up on. */
   if (e->thinking > THINK_CAP)
@@ -1191,7 +1204,13 @@ rc8650_read (rc8650_t *e, uint8_t *pcm, size_t max_samples, int *done)
   while (pcm_available (e) < max_samples && e->work)
     {
       step_and_track (e);
-      if (e->started && !dma_active () && pcm_available (e) > 0)
+      if (dma_active ())
+	e->dma_seen = 1;
+      /* Only once DMA has run: the musical tone generator writes the D/A
+	 from code and never starts it, so for that "DMA idle" says nothing,
+	 and taking it as the end would hand back one sample per read.  TS
+	 falling ends that output exactly. */
+      else if (e->started && e->dma_seen && pcm_available (e) > 0)
 	break;
     }
   e->audio_pump = 0;

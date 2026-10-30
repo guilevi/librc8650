@@ -32,7 +32,7 @@
      {
 --- a/sim/m32c/main.c
 +++ b/sim/m32c/main.c
-@@ -127,10 +127,30 @@
+@@ -127,10 +127,31 @@
  }
  #endif
  
@@ -40,6 +40,7 @@
 +extern int m32c_baremetal;
 +extern int m32c_rc865x;
 +extern int m32c_p8_or;
++extern int m32c_p7_or;
 +extern int m32c_rx_ic;
 +extern int m32c_tb2_vector;
 +extern int m32c_rx_force;
@@ -63,17 +64,18 @@
    int save_trace;
    bfd *prog;
  #ifdef HAVE_networking
-@@ -141,6 +161,54 @@
-   setbuf (stdout, 0);
+@@ -142,6 +163,56 @@
  
    in_gdb = 0;
-+
+ 
 +  if (getenv ("M32C_BAREMETAL"))
 +    m32c_baremetal = 1;
 +  if (getenv ("M32C_RC865X"))
 +    m32c_rc865x = 1;
 +  if ((e = getenv ("M32C_P8_OR")) != NULL)
 +    m32c_p8_or = strtol (e, NULL, 16);
++  if ((e = getenv ("M32C_P7_OR")) != NULL)
++    m32c_p7_or = strtol (e, NULL, 16);
 +  if ((e = getenv ("M32C_RX_IC")) != NULL)
 +    m32c_rx_ic = strtol (e, NULL, 16);
 +  if ((e = getenv ("M32C_TB2_VECTOR")) != NULL)
@@ -115,10 +117,11 @@
 +	/* unbuffered, so short captures through a FIFO work */
 +	setvbuf (m32c_dac_file, NULL, _IONBF, 0);
 +    }
- 
++
    while ((o = getopt_long (argc, argv, "tc:vdm:C", longopts, NULL))
  	 != -1)
-@@ -205,6 +273,7 @@
+     switch (o)
+@@ -205,6 +276,7 @@
    trace = 0;
    m32c_load (prog);
    trace = save_trace;
@@ -126,7 +129,7 @@
  
  #ifdef HAVE_networking
    if (console_port_s)
-@@ -240,5 +309,6 @@
+@@ -240,5 +312,6 @@
  #ifdef TIMER_A
        update_timer_a ();
  #endif
@@ -135,7 +138,7 @@
  }
 --- a/sim/m32c/mem.c
 +++ b/sim/m32c/mem.c
-@@ -43,6 +43,192 @@
+@@ -43,6 +43,197 @@
  #include "timer_a.h"
  #endif
  
@@ -167,6 +170,11 @@
 +int m32c_baremetal = 0;		/* ignore the hosted hooks at 0xe1, 0x400-0x403 */
 +int m32c_rc865x = 0;		/* RC8650/RC8660 board peripheral stubs */
 +int m32c_p8_or = 0;		/* value OR'd into reads of port 8 (0x3f0) */
++/* Port 7 inputs the board ties.  P7.7 is TA3IN, the gate of the sample clock,
++   and it is the SUSP0# pin: "Suspends audio output when Low... Connect these
++   pins to a High level if not used."  Left low, the musical tone generator,
++   which checks it in software, waits for the suspend to lift forever.  */
++int m32c_p7_or = 0;		/* value OR'd into reads of port 7 (0x3ed) */
 +int m32c_rx_nocts = 0;		/* ignore CTS# (P6_0) when presenting rx bytes */
 +int m32c_p6_driven = 0;		/* firmware has written P6 at least once */
 +int m32c_tx_pc = 0;		/* log the PC of every U0TB write to stderr */
@@ -328,7 +336,7 @@
  #define L1_BITS  (10)
  #define L2_BITS  (10)
  #define OFF_BITS (12)
-@@ -213,15 +399,49 @@
+@@ -213,15 +404,49 @@
    m = mem_ptr (address);
    if (trace)
      printf (" %02x", value);
@@ -379,7 +387,7 @@
  	int i;
  	if (old_led != value)
  	  {
-@@ -301,21 +521,90 @@
+@@ -301,21 +526,90 @@
        break;
  
      case 0x400:
@@ -475,7 +483,7 @@
  }
  
  void
-@@ -330,7 +619,7 @@
+@@ -330,7 +624,7 @@
  void
  mem_put_hi (int address, unsigned short value)
  {
@@ -484,7 +492,7 @@
      {
        printf ("SimTrace: %06lx %04x\n", regs.r_pc, value);
        return;
-@@ -414,12 +703,120 @@
+@@ -414,12 +708,122 @@
  }
  #endif
  
@@ -593,6 +601,8 @@
 +	    return rx_byte;
 +	  }
 +	return 0;
++      case 0x3ed:		/* P7 - SUSP0# on P7.7 */
++	return *m | m32c_p7_or;
 +      case 0x3f0:		/* P8 - echo P8.3 onto P8.4 (companion handshake) */
 +	{
 +	  unsigned char v = *m;
@@ -605,7 +615,7 @@
    switch (address)
      {
  #ifdef HAVE_TERMIOS_H
-@@ -618,3 +1015,137 @@
+@@ -618,3 +1022,154 @@
      }
  }
  #endif
@@ -742,6 +752,23 @@
 +      if (best >= 0)
 +	trigger_peripheral_interrupt (best - 0x40, best);
 +    }
++}
++
++/* Return the board's peripherals to their power-on state.  Their state lives in
++   file-scope variables, which a reload of the firmware image does not touch: an
++   embedder that cold-boots the chip again must call this, with init_mem and
++   init_regs, or the next boot starts with the timers, the DMA channels and the
++   receive path as the last session left them -- which cost the first utterance
++   after a reset its opening 558 samples.  */
++void
++m32c_rc865x_reset (void)
++{
++  memset (&timer_b2, 0, sizeof timer_b2);
++  memset (&timer_a3, 0, sizeof timer_a3);
++  memset (dma_init, 0, sizeof dma_init);
++  extflash_state = extflash_idmode = 0;
++  rx_have = rx_eof = rx_pending = 0;
++  m32c_p6_driven = 0;
 +}
 --- a/sim/m32c/r8c.opc
 +++ b/sim/m32c/r8c.opc
