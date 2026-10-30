@@ -33,6 +33,8 @@ extern int (*rc865x_hook_rx) (unsigned char *);
 extern void (*rc865x_hook_tx) (unsigned char);
 extern void (*rc865x_hook_dac) (unsigned char);
 extern int m32c_rc865x_dac_period (void);
+extern unsigned long long m32c_f1_clock;
+extern int m32c_dma_write;
 extern int trace, verbose, enable_counting, m32c_p6_driven;
 
 /* Instruction budgets.  These are generous ceilings, not expected costs: the
@@ -63,10 +65,11 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
  * measured across sixty utterances covering every voice, both speed scales,
  * all sixteen punctuation modes, maximum word delay and reverb, comma-heavy and
  * sentence-heavy text: the longest gap between two samples anywhere was 206
- * instructions under the old clock model.  Timer A3 ticks every 737 cycles at
- * the default rate, 184 instructions, and real-time playback at 4 kHz stretches
- * that to about 460.  There is no such thing as a pause in the middle of
- * speech.
+ * instructions under the old clock and timing model.  Timer A3 now ticks every
+ * 737 f1 cycles at the default rate, with the CPU at half that clock and each
+ * instruction charged its own cycles, and real-time playback at 4 kHz stretches
+ * the tick to two and a half times that.  There is no such thing as a pause in
+ * the middle of speech.
  *
  * Quiet was never the right thing to END on, though, because the chip can go
  * quiet for a long time BEFORE it is finished starting: it emits a short burst
@@ -194,6 +197,13 @@ struct rc8650
   size_t image_len;
   unsigned char *image_srec;
   size_t image_srec_len;
+
+  int cd_run;			/* CPU-written D/A samples since the last DMA one */
+  int cd_active;		/* code-driven D/A output is being rendered */
+  unsigned char cd_level;	/* the D/A's level since cd_t */
+  unsigned long long cd_t;	/* f1 time the level was accounted up to */
+  unsigned long long cd_end;	/* f1 time the current output sample ends */
+  double cd_acc;		/* level x cycles in the current output sample */
 
   int rs_have;			/* a D/A sample is held in rs_prev */
   unsigned char rs_prev;	/* the last D/A sample */
@@ -506,12 +516,74 @@ dac_out (rc8650_t *e, unsigned char v)
     e->samples_out++;
 }
 
+/* D/A writes the CPU makes itself, rather than the DMA on the sample clock,
+   are rendered by time.  The musical tone generator is the one that does
+   this: a cycle-counted loop writing pulses a few dozen microseconds wide,
+   much narrower than an output sample, so counting writes as samples - right
+   for DMA output, where each write lasts exactly one sample-clock period -
+   loses both its pitch and its energy.  Here the D/A is a level held between
+   writes, and each output sample is that level averaged over NOMINAL_PERIOD
+   f1 cycles of the simulator's clock.
+
+   Only once such writes are sustained, though: CD_RUN of them with no DMA
+   sample between.  Speech, DTMF and the sinusoidal generator open with a
+   couple of CPU writes before the DMA takes over - a 0 at boot, a 128 at the
+   start of output - and rendering the gap between those by time put nine
+   samples of 0 in front of every first utterance.  Below CD_RUN a write is
+   one sample, as it always was. */
+#define CD_RUN 16
+
+static void
+cd_advance (rc8650_t *e, unsigned long long now)
+{
+  while (now >= e->cd_end)
+    {
+      e->cd_acc += e->cd_level * (double) (e->cd_end - e->cd_t);
+      dac_out (e, (unsigned char) lround (e->cd_acc / NOMINAL_PERIOD));
+      e->cd_acc = 0;
+      e->cd_t = e->cd_end;
+      e->cd_end += NOMINAL_PERIOD;
+    }
+  e->cd_acc += e->cd_level * (double) (now - e->cd_t);
+  e->cd_t = now;
+}
+
+/* Close the output sample in progress, holding the last level to its end. */
+static void
+cd_flush (rc8650_t *e)
+{
+  if (!e->cd_active)
+    return;
+  cd_advance (e, e->cd_end);
+  e->cd_active = 0;
+}
+
 static void
 hook_dac (unsigned char v)
 {
   rc8650_t *e = the_engine;
   if (!e)
     return;
+  if (!m32c_dma_write && ++e->cd_run < CD_RUN)
+    dac_out (e, v);
+  else if (!m32c_dma_write)
+    {
+      if (!e->cd_active)
+	{
+	  e->cd_active = 1;
+	  e->cd_t = m32c_f1_clock;
+	  e->cd_end = m32c_f1_clock + NOMINAL_PERIOD;
+	  e->cd_acc = 0;
+	}
+      else
+	cd_advance (e, m32c_f1_clock);
+      e->cd_level = v;
+    }
+  if (!m32c_dma_write)
+    goto heard;
+  e->cd_run = 0;
+  cd_flush (e);
+
   /* Resample to NOMINAL_PERIOD by linear interpolation between this sample
      and the last, each held for the period now programmed.  An output instant
      that lands exactly on a D/A sample gets that sample, so at the nominal
@@ -539,6 +611,7 @@ hook_dac (unsigned char v)
       }
     e->rs_prev = v;
   }
+heard:
   e->since_sample = 0;
   /* Audio is flowing, so this work item is alive whatever the pins say - that
      keeps THINK_CAP from expiring mid-utterance if TS is ever unavailable. */
@@ -743,7 +816,7 @@ boot (rc8650_t *e, char **err)
   e->work = e->started = e->talking = e->heard = e->dma_seen = 0;
   e->mark_head = e->mark_tail = 0;
   e->samples_out = e->samples_read = 0;
-  e->rs_have = 0;
+  e->rs_have = e->cd_active = e->cd_run = 0;
 
   /* Run the BIOS and firmware init through to the point where the chip
    * asserts CTS#, so callers get a device that is ready to be spoken to. */
@@ -1040,7 +1113,7 @@ deliver_stop (rc8650_t *e)
   e->mark_head = e->mark_tail = 0;
   e->samples_read = e->samples_out;
   e->pcm_head = e->pcm_tail = 0;
-  e->rs_have = 0;
+  e->rs_have = e->cd_active = e->cd_run = 0;
   /* Whatever the filter was ringing on has just been dropped; carrying its
      state into the next utterance would start it with a click. */
   biquad_reset (e);
@@ -1265,6 +1338,8 @@ rc8650_read (rc8650_t *e, uint8_t *pcm, size_t max_samples, int *done)
 	break;
     }
   e->audio_pump = 0;
+  if (!e->work)
+    cd_flush (e);
 
   n = ring_get (e->pcm, PCM_CAP, e->pcm_head, &e->pcm_tail, pcm,
 		max_samples);

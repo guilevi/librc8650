@@ -14,6 +14,50 @@
    HI mask;
    union
    {
+@@ -228,3 +235,43 @@
+ extern void trace_register_changes (void);
+ 
+ extern void m32c_dump_all_registers (void);
++
++/* Instruction timing, from the Renesas M16C/60, M16C/20, M16C/Tiny Series
++   Software Manual, chapter 4: CPU cycles with a full instruction queue and no
++   wait states.  Each r8c.opc pattern names a rule with one of the CYC_
++   macros; the operand decoders note each operand's addressing mode, in the
++   order they are decoded; and m32c_insn_cpu_cycles works the cycles out once
++   the instruction has run, so a pattern that returns early is still timed.
++   CYC_EXTRA adds what depends on the data: a branch taken, a shift count, a
++   string length.
++
++   Mode columns follow the manual's tables: 0 Rn, 1 An, 2 [An], 3 dsp:8[An],
++   4 dsp:8[SB/FB], 5 dsp:16[An] (dsp:20 for jumps), 6 dsp:16[SB], 7 abs16.  */
++extern int m32c_cyc_kind, m32c_cyc_p[8], m32c_cyc_extra;
++extern int m32c_cyc_mode[4], m32c_cyc_nmode;
++int m32c_insn_cpu_cycles (void);
++void m32c_cyc_note (int code);
++
++enum { CYC_NONE, CYC_KIND_K, CYC_KIND_RM, CYC_KIND_RM1, CYC_KIND_SD,
++       CYC_KIND_SRC, CYC_KIND_T8, CYC_KIND_MUL };
++
++/* A constant.  */
++#define CYC_K(n) (m32c_cyc_kind = CYC_KIND_K, m32c_cyc_p[0] = (n))
++/* One operand, the first decoded: r if a register, m if memory.  */
++#define CYC_RM(r, m) \
++  (m32c_cyc_kind = CYC_KIND_RM, m32c_cyc_p[0] = (r), m32c_cyc_p[1] = (m))
++/* The same, by the second operand decoded.  */
++#define CYC_RM1(r, m) \
++  (m32c_cyc_kind = CYC_KIND_RM1, m32c_cyc_p[0] = (r), m32c_cyc_p[1] = (m))
++/* src,dest arithmetic: b, plus one for each operand in memory.  */
++#define CYC_SD(b) (m32c_cyc_kind = CYC_KIND_SD, m32c_cyc_p[0] = (b))
++/* src,dest moves: b, plus one if the source is in memory.  */
++#define CYC_SRC(b) (m32c_cyc_kind = CYC_KIND_SRC, m32c_cyc_p[0] = (b))
++/* A full table by the first operand's mode column.  */
++#define CYC_T8(a, b, c, d, e, f, g, h) \
++  (m32c_cyc_kind = CYC_KIND_T8, m32c_cyc_p[0] = (a), m32c_cyc_p[1] = (b), \
++   m32c_cyc_p[2] = (c), m32c_cyc_p[3] = (d), m32c_cyc_p[4] = (e), \
++   m32c_cyc_p[5] = (f), m32c_cyc_p[6] = (g), m32c_cyc_p[7] = (h))
++/* MUL/MULU src,dest, whose table and .W notes are their own.  */
++#define CYC_MUL(w) (m32c_cyc_kind = CYC_KIND_MUL, m32c_cyc_p[0] = (w))
++#define CYC_EXTRA(n) (m32c_cyc_extra += (n))
 --- a/sim/m32c/int.c
 +++ b/sim/m32c/int.c
 @@ -42,7 +42,12 @@
@@ -138,7 +182,7 @@
  }
 --- a/sim/m32c/mem.c
 +++ b/sim/m32c/mem.c
-@@ -43,6 +43,197 @@
+@@ -43,6 +43,207 @@
  #include "timer_a.h"
  #endif
  
@@ -232,6 +276,14 @@
 +  int count, reload, cycles, on;
 +} timer_a3;
 +
++/* Time, in f1 cycles since boot.  While an instruction runs it holds the
++   instant that instruction started; while a timer-triggered DMA transfer
++   runs, the instant of the underflow that triggered it.  m32c_dma_write is
++   set for the duration of a DMA transfer, so a D/A write hook can tell a
++   sample the DMA clocked out from one the CPU wrote itself.  */
++unsigned long long m32c_f1_clock;
++int m32c_dma_write;
++
 +/* The M16C DMA controller.  DMA0: SAR 0x20, DAR 0x24, TCR 0x28, DM0CON 0x2C,
 +   request select DM0SL 0x3B8; DMA1 the same shape at 0x30/0x34/0x38/0x3C,
 +   DM1SL 0x3BA.  DMxCON: b0 8-bit, b1 repeat, b3 enable, b4 source-forward,
@@ -305,9 +357,11 @@
 +      tcr = *mem_ptr (base + 8) | (*mem_ptr (base + 9) << 8);
 +      step = (con & 0x01) ? 1 : 2;
 +
++      m32c_dma_write = 1;
 +      mem_put_qi (dar, *mem_ptr (sar & membus_mask));
 +      if (step == 2)
 +	mem_put_qi (dar + 1, *mem_ptr ((sar + 1) & membus_mask));
++      m32c_dma_write = 0;
 +
 +      if (con & 0x10)
 +	sar += step;
@@ -336,7 +390,7 @@
  #define L1_BITS  (10)
  #define L2_BITS  (10)
  #define OFF_BITS (12)
-@@ -213,15 +404,49 @@
+@@ -213,15 +414,49 @@
    m = mem_ptr (address);
    if (trace)
      printf (" %02x", value);
@@ -387,7 +441,7 @@
  	int i;
  	if (old_led != value)
  	  {
-@@ -301,21 +526,90 @@
+@@ -301,21 +536,90 @@
        break;
  
      case 0x400:
@@ -483,7 +537,7 @@
  }
  
  void
-@@ -330,7 +624,7 @@
+@@ -330,7 +634,7 @@
  void
  mem_put_hi (int address, unsigned short value)
  {
@@ -492,7 +546,7 @@
      {
        printf ("SimTrace: %06lx %04x\n", regs.r_pc, value);
        return;
-@@ -414,12 +708,122 @@
+@@ -414,12 +718,122 @@
  }
  #endif
  
@@ -615,7 +669,7 @@
    switch (address)
      {
  #ifdef HAVE_TERMIOS_H
-@@ -618,3 +1022,154 @@
+@@ -618,3 +1032,187 @@
      }
  }
  #endif
@@ -626,6 +680,9 @@
 +void
 +update_timer_b2 (void)
 +{
++  static int irq_cycles;
++  int f1;
++
 +  if (m32c_pcsample)
 +    {
 +      static unsigned long n = 0;
@@ -664,18 +721,33 @@
 +  if (!m32c_rc865x)
 +    return;
 +
++  /* What the instruction just executed cost, in f1 cycles - the clock the
++     timers count.  The CPU runs from the main clock divided as CM0/CM1 say;
++     this firmware sets CM1 = 0x40, divide by two, so the CPU runs at
++     3.6864 MHz against the timers' 7.3728.  The cycle counts themselves are
++     the software manual's, per instruction (see m32c_insn_cpu_cycles); an
++     instruction without one is charged M32C_CPI f1 cycles, the old flat
++     estimate.  An interrupt accepted after the last instruction adds its
++     interrupt sequence, 18 cycles (software manual table 5.3.1).  */
++  {
++    static const int cm1div[4] = { 1, 2, 4, 16 };
++    int div = (*mem_ptr (0x06) & 0x40) ? 8 : cm1div[*mem_ptr (0x07) >> 6];
++    int cyc = m32c_insn_cpu_cycles () + irq_cycles;
++    f1 = cyc ? cyc * div : m32c_cpi;
++    irq_cycles = 0;
++  }
++
 +  if (timer_b2.bsr & 0x80)	/* TB2S - counting */
 +    {
-+      /* The timer counts CPU cycles but the sim used to charge only one per
-+	 instruction; a real M16C averages ~4.  Undercounting made the sample
-+	 clock ~4x slow relative to code execution, so speech synthesis
-+	 lapped the 1024-byte DMA ring and the firmware's produced==played
-+	 check (a mod-1024 pointer compare) ended playback a lap early,
-+	 truncating utterances.  M32C_CPI overrides.  */
-+      timer_b2.prescale -= m32c_cpi;
-+      if (timer_b2.prescale < 0)
++      /* The timer counts f1 cycles.  It once counted one per instruction,
++	 which made the sample clock ~4x slow relative to code execution:
++	 speech synthesis lapped the 1024-byte DMA ring and the firmware's
++	 produced==played check (a mod-1024 pointer compare) ended playback
++	 a lap early, truncating utterances.  */
++      timer_b2.prescale -= f1;
++      while (timer_b2.prescale < 0)
 +	{
-+	  timer_b2.prescale += 9;	/* count source f8 (TB2MR TCK = 01) */
++	  timer_b2.prescale += 8;	/* count source f8 (TB2MR TCK = 01) */
 +	  timer_b2.count--;
 +	  if (timer_b2.count < 0)
 +	    {
@@ -706,18 +778,28 @@
 +      static const int div[4] = { 1, 8, 32, 32 };
 +      int d = div[*mem_ptr (0x399) >> 6];
 +
-+      timer_a3.cycles += m32c_cpi;
++      unsigned long long t0 = m32c_f1_clock;
++      int carried = timer_a3.cycles, used = 0;
++
++      timer_a3.cycles += f1;
 +      while (timer_a3.cycles >= d)
 +	{
 +	  timer_a3.cycles -= d;
++	  used += d;
 +	  if (--timer_a3.count < 0)
 +	    {
 +	      timer_a3.count = timer_a3.reload;
 +	      *mem_ptr (0x58) |= 0x08;	/* TA3IC: request */
++	      /* The underflow's own instant, not the instruction's: the
++		 cycles carried over from before this instruction counted
++		 towards it too.  */
++	      m32c_f1_clock = t0 + used - carried;
 +	      dma_service (5);
 +	    }
 +	}
++      m32c_f1_clock = t0;
 +    }
++  m32c_f1_clock += f1;
 +
 +  /* UART0 receive.  The firmware only reads U0RB from its receive interrupt
 +     handler (0x0A04A0); its polling loop enters below that at 0x0A04A5.  Raise
@@ -750,7 +832,10 @@
 +	    }
 +	}
 +      if (best >= 0)
-+	trigger_peripheral_interrupt (best - 0x40, best);
++	{
++	  trigger_peripheral_interrupt (best - 0x40, best);
++	  irq_cycles = 18;
++	}
 +    }
 +}
 +
@@ -769,14 +854,15 @@
 +  extflash_state = extflash_idmode = 0;
 +  rx_have = rx_eof = rx_pending = 0;
 +  m32c_p6_driven = 0;
++  m32c_f1_clock = 0;
++  m32c_dma_write = 0;
 +}
 --- a/sim/m32c/r8c.opc
 +++ b/sim/m32c/r8c.opc
-@@ -111,6 +111,17 @@
-   b = get_src (dc);
+@@ -112,6 +112,17 @@
  
  #define carry (FLAG_C ? 1 : 0)
-+
+ 
 +/* MUL/MULU/DIV/DIVU/DIVX do *not* get the "A0/A1 in .B means a 16-bit
 +   operation" treatment that ADD/SUB/AND/OR/XOR/CMP/TST/MOV/ADC/SBB/LDE get:
 +   the manual says "If you specified an A0 or A1 for either src or dest,
@@ -787,9 +873,10 @@
 +  sd.areg = 0;
 +  return sd;
 +}
- 
++
  static void
  cmp (int d, int s, int w)
+ {
 @@ -145,7 +156,7 @@
      s = IMM(w);
    else
@@ -811,7 +898,577 @@
      }
  
    if (s == 0)
-@@ -850,6 +864,10 @@
+@@ -202,6 +216,8 @@
+   int v = get_src (sd);
+   int c = carry, ct;
+ 
++  CYC_EXTRA (count < 0 ? -count : count);	/* one cycle per bit */
++
+   tprintf("%s %x by %d\n", rotc ? "rotc" : "rot", v, count);
+   tprintf (": %s %d\n", bits(v, 8*sd.bytes), c);
+   while (count > 0)
+@@ -235,6 +251,8 @@
+   int v = get_src (sd);
+   int c = 0;
+ 
++  CYC_EXTRA (count < 0 ? -count : count);	/* one cycle per bit */
++
+   if (sd.bytes == 4)
+     {
+       mask = 0xffffffffU;
+@@ -317,12 +335,15 @@
+   int imm;
+ 
+   step_result = M32C_MAKE_STEPPED ();
++  m32c_cyc_kind = CYC_NONE;
++  m32c_cyc_nmode = m32c_cyc_extra = 0;
+ 
+   tprintf("trace: decode pc = %05x\n", orig_pc);
+ 
+   /** VARY dst 011 100 101 110 111 */
+ 
+   /** 0111 011w 1111 dest  ABS.size dest */
++  CYC_RM (3, 5);
+ 
+   UNARY_SOP;
+   a = v<0 ? -v : v;
+@@ -331,12 +352,14 @@
+   put_dest (dc, a);
+ 
+   /** 0111 011w 0110 dest  ADC.size #IMM,dest */
++  CYC_RM (2, 4);
+ 
+   dc = decode_srcdest4(dest, w);
+   imm = IMM(w);
+   MATH_OP (dc, imm, carry, +, > (w?0xffff:0xff));
+ 
+   /** 1011 000w srcx dest  ADC.size src,dest */
++  CYC_SD (2);
+ 
+   sc = decode_srcdest4(srcx, w);
+   dc = decode_srcdest4(dest, w);
+@@ -344,29 +367,34 @@
+   MATH_OP (dc, b, carry, +, > (w?0xffff:0xff));
+ 
+   /** 0111 011w 1110 dest  ADCF.size dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_srcdest4(dest, w);
+   MATH_OP (dc, 0, carry, +, > (w?0xffff:0xff));
+ 
+   /** 0111 011w 0100 dest  ADD.size:G #imm,dest */
++  CYC_RM (2, 4);
+ 
+   dc = decode_srcdest4(dest, w);
+   imm = IMM(w);
+   MATH_OP (dc, imm, 0, +, > (w?0xffff:0xff));
+ 
+   /** 1100 100w immm dest  ADD.size:Q #IMM,dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_srcdest4(dest, w);
+   imm = sign_ext (immm, 4);
+   MATH_OP (dc, imm, 0, +, > (w?0xffff:0xff));
+ 
+   /** 1000 0dst            ADD.B:S #IMM8,dst */
++  CYC_RM (1, 3);
+ 
+   imm = IMM(0);
+   dc = decode_dest3 (dst, 0);
+   MATH_OP (dc, imm, 0, +, > 0xff);
+ 
+   /** 1010 000w srcx dest  ADD.size:G src,dest */
++  CYC_SD (2);
+ 
+   sc = decode_srcdest4(srcx, w);
+   dc = decode_srcdest4(dest, w);
+@@ -374,6 +402,7 @@
+   MATH_OP (dc, b, 0, +, > (w?0xffff:0xff));
+ 
+   /** 0010 0d sr           ADD.B:S src,R0L/R0H */
++  CYC_RM (2, 3);
+ 
+   sc = decode_src2 (sr, 0, d);
+   dc = decode_dest1 (d, 0);
+@@ -381,18 +410,21 @@
+   MATH_OP (dc, b, 0, +, > 0xff);
+ 
+   /** 0111 110w 1110 1011  ADD.size:G #IMM,sp */
++  CYC_K (2);
+ 
+   dc = reg_sd (sp);
+   imm = sign_ext (IMM(w), w?16:8);
+   MATH_OP (dc, imm, 0, +, > 0xffff);
+ 
+   /** 0111 1101 1011 immm  ADD.size:Q #IMM,sp */
++  CYC_K (1);
+ 
+   dc = reg_sd (sp);
+   imm = sign_ext (immm, 4);
+   MATH_OP (dc, imm, 0, +, > 0xffff);
+ 
+   /** 1111 100w immm dest  ADJNZ.size #IMM,dest,label */
++  CYC_RM (3, 5);
+ 
+   UNARY_UOP;
+   imm = sign_ext(immm, 4);
+@@ -402,12 +434,14 @@
+   a = sign_ext (IMM(0), 8);
+   if ((v & (w ? 0xffff : 0xff)) != 0)
+     {
++      CYC_EXTRA (4);
+       tprintf("jmp: %x + 2 + %d = ", get_reg (pc), a);
+       put_reg (pc, orig_pc + 2 + a);
+       tprintf("%x\n", get_reg (pc));
+     }
+ 
+   /** 0111 011w 0010 dest  AND.size:G #IMM,dest */
++  CYC_RM (2, 4);
+ 
+   UNARY_UOP;
+   imm = IMM(w);
+@@ -417,6 +451,7 @@
+   put_dest (dc, v);
+ 
+   /** 1001 0dst            AND.B:S #IMM8,dest */
++  CYC_RM (1, 3);
+ 
+   imm = IMM(0);
+   dc = decode_dest3 (dst, 0);
+@@ -427,6 +462,7 @@
+   put_dest (dc, v);
+ 
+   /** 1001 000w srcx dest  AND.size:G src.dest */
++  CYC_SD (2);
+ 
+   BINARY_UOP;
+   tprintf ("%x & %x = %x\n", a, b, a & b);
+@@ -435,6 +471,7 @@
+   put_dest (dc, v);
+ 
+   /** 0001 0d sr           AND.B:S src,R0L/R0H */
++  CYC_RM (2, 3);
+ 
+   sc = decode_src2 (sr, 0, d);
+   dc = decode_dest1 (d, 0);
+@@ -446,20 +483,24 @@
+   put_dest (dc, v);
+ 
+   /** 0111 1110 0100 srcx  BAND src */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   BIT_OPC (srcx, b & carry);
+ 
+   /** 0111 1110 1000 dest  BCLR:G dest */
++  CYC_T8 (2, 2, 6, 6, 3, 6, 3, 3);
+ 
+   dc = decode_bit (dest);
+   put_bit (dc, 0);
+ 
+   /** 0100 0bit            BCLR:S bit,base:11[SB] */
++  CYC_K (3);
+ 
+   dc = decode_bit11 (bit);
+   put_bit (dc, 0);
+ 
+   /** 0111 1110 0010 dest  BMcnd dest  */
++  CYC_T8 (6, 6, 10, 10, 7, 10, 7, 7);
+ 
+   dc = decode_bit (dest);
+   if (condition_true (bmcnd_cond_map [IMM (0) & 15]))
+@@ -468,44 +509,56 @@
+     put_bit (dc, 0);
+ 
+   /** 0111 1101 1101 cond  BMcnd C  */
++  CYC_K (1);
+ 
+   if (condition_true (cond))
+-    set_c (1);
++    {
++      set_c (1);
++      CYC_EXTRA (1);
++    }
+   else
+     set_c (0);
+ 
+   /** 0111 1110 0101 srcx  BNAND src */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   BIT_OPC (srcx, (!b) & carry);
+ 
+   /** 0111 1110 0111 srcx  BNOR src */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   BIT_OPC (srcx, (!b) | carry);
+ 
+   /** 0111 1110 1010 dest  BNOT:G dest */
++  CYC_T8 (2, 2, 6, 6, 3, 6, 3, 3);
+ 
+   BIT_OP (dest, !b);
+ 
+   /** 0101 0bit            BNOT:S bit,base:11[SB] */
++  CYC_K (3);
+ 
+   dc = decode_bit11 (bit);
+   put_bit (dc, !get_bit (dc));
+ 
+   /** 0111 1110 0011 srcx  BNTST src */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   dc = decode_bit (srcx);
+   b = get_bit (dc);
+   set_zc (!b, !b);
+ 
+   /** 0111 1110 1101 srcx  BNXOR src */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   BIT_OPC (srcx, !b ^ carry);
+ 
+   /** 0111 1110 0110 srcx  BOR src */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   BIT_OPC (srcx, b | carry);
+ 
+   /** 0000 0000            BRK */
++  CYC_K (27);
+ 
+   /* We report the break to our caller with the PC still pointing at the 
+      breakpoint instruction.  */
+@@ -515,28 +568,33 @@
+   return M32C_MAKE_HIT_BREAK ();
+ 
+   /** 0111 1110 1001 dest  BSET:G dest */
++  CYC_T8 (2, 2, 6, 6, 3, 6, 3, 3);
+ 
+   dc = decode_bit (dest);
+   put_bit (dc, 1);
+ 
+   /** 0100 1bit            BSET:S bit,base:11[SB] */
++  CYC_K (3);
+ 
+   dc = decode_bit11 (bit);
+   put_bit (dc, 1);
+ 
+   /** 0111 1110 1011 srcx  BTST:G src */
++  CYC_T8 (2, 2, 6, 6, 3, 6, 3, 3);
+ 
+   dc = decode_bit (srcx);
+   b = get_bit (dc);
+   set_zc (!b, b);
+ 
+   /** 0101 1bit            BTST:S bit,base:11[SB] */
++  CYC_K (3);
+ 
+   dc = decode_bit11 (bit);
+   b = get_bit (dc);
+   set_zc (!b, b);
+ 
+   /** 0111 1110 0000 dest  BTSTC dest */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   dc = decode_bit (dest);
+   b = get_bit (dc);
+@@ -544,6 +602,7 @@
+   put_bit (dc, 0);
+ 
+   /** 0111 1110 0001 dest  BTSTS dest */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   dc = decode_bit (dest);
+   b = get_bit (dc);
+@@ -551,22 +610,26 @@
+   put_bit (dc, 1);
+ 
+   /** 0111 1110 1100 srcx  BXOR src */
++  CYC_T8 (3, 3, 7, 7, 4, 7, 4, 4);
+ 
+   BIT_OPC (srcx, b ^ carry);
+ 
+   /** 0111 011w 1000 dest  CMP.size:G #IMM,dest */
++  CYC_RM (2, 4);
+ 
+   UNARY_UOP;
+   imm = IMM(w);
+   cmp (v, imm, w);
+ 
+   /** 1101 000w immm dest  CMP.size:Q #IMM,dest */
++  CYC_RM (1, 3);
+ 
+   UNARY_UOP;
+   immm = sign_ext (immm, 4);
+   cmp (v, immm, w);
+ 
+   /** 1110 0dst            CMP.B:S #IMM8,dest */
++  CYC_RM (1, 3);
+ 
+   imm = IMM(0);
+   dc = decode_dest3 (dst, 0);
+@@ -574,11 +637,13 @@
+   cmp (v, imm, 0);
+ 
+   /** 1100 000w srcx dest  CMP.size:G src,dest */
++  CYC_SD (2);
+ 
+   BINARY_UOP;
+   cmp(b, a, w);
+ 
+   /** 0011 1d sr           CMP.B:S src,R0L/R0H */
++  CYC_RM (2, 3);
+ 
+   sc = decode_src2 (sr, 0, d);
+   dc = decode_dest1 (d, 0);
+@@ -587,6 +652,7 @@
+   cmp (b, a, 0);
+ 
+   /** 0111 110w 1110 i1c s  DADC,DADD,DSBB,DSUB */
++  CYC_K (s ? 4 : 5);
+ 
+   /* w = width, i = immediate, c = carry, s = subtract */
+ 
+@@ -628,6 +694,7 @@
+   }
+ 
+   /** 1010 1dst            DEC.B dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_dest3 (dst, 0);
+   v = get_src (dc);
+@@ -637,6 +704,7 @@
+   put_dest (dc, v);
+ 
+   /** 1111 d010            DEC.W dest */
++  CYC_K (1);
+ 
+   v = get_reg (d ? a1 : a0);
+   tprintf("%x -- = %x\n", v, v-1);
+@@ -645,30 +713,37 @@
+   put_reg (d ? a1 : a0, v);
+ 
+   /** 0111 110w 1110 0001  DIV.size #IMM */
++  CYC_K (w ? 28 : 22);
+ 
+   div_op (-1, 0, 0, w);
+ 
+   /** 0111 011w 1101 srcx  DIV.size src */
++  CYC_RM (w ? 28 : 22, w ? 30 : 24);
+ 
+   div_op (srcx, 0, 0, w);
+ 
+   /** 0111 110w 1110 0000  DIVU.size #IMM */
++  CYC_K (w ? 25 : 18);
+ 
+   div_op (-1, 1, 0, w);
+ 
+   /** 0111 011w 1100 srcx  DIVU.size src */
++  CYC_RM (w ? 25 : 18, w ? 27 : 20);
+ 
+   div_op (srcx, 1, 0, w);
+ 
+   /** 0111 110w 1110 0011  DIVX.size #IMM */
++  CYC_K (w ? 28 : 22);
+ 
+   div_op (-1, 0, 1, w);
+ 
+   /** 0111 011w 1001 srcx  DIVX.size src */
++  CYC_RM (w ? 28 : 22, w ? 30 : 24);
+ 
+   div_op (srcx, 0, 1, w);
+ 
+   /** 0111 1100 1111 0010  ENTER #IMM8 */
++  CYC_K (4);
+ 
+   imm = IMM(0);
+   put_reg (sp, get_reg (sp) - 2);
+@@ -677,6 +752,7 @@
+   put_reg (sp, get_reg (sp) - imm);
+ 
+   /** 0111 1101 1111 0010  EXITD */
++  CYC_K (9);
+ 
+   put_reg (sp, get_reg (fb));
+   put_reg (fb, mem_get_hi (get_reg (sp)));
+@@ -685,6 +761,7 @@
+   put_reg (sp, get_reg (sp) + 3);
+ 
+   /** 0111 1100 0110 dest  EXTS.B dest */
++  CYC_RM (3, 5);
+ 
+   dc = decode_srcdest4 (dest, 0);
+   v = sign_ext (get_src (dc), 8);
+@@ -693,20 +770,24 @@
+   set_sz (v, 1);
+ 
+   /** 0111 1100 1111 0011  EXTS.W R0 */
++  CYC_K (3);
+ 
+   v = sign_ext (get_reg (r0), 16);
+   put_reg (r2r0, v);
+   set_sz (v, 2);
+ 
+   /** 1110 1011 0flg 0101  FCLR dest */
++  CYC_K (2);
+ 
+   set_flags (1 << flg, 0);
+ 
+   /** 1110 1011 0flg 0100  FSET dest */
++  CYC_K (2);
+ 
+   set_flags (1 << flg, 1 << flg);
+ 
+   /** 1010 0dst            INC.B dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_dest3 (dst, 0);
+   v = get_src (dc);
+@@ -716,6 +797,7 @@
+   put_dest (dc, v);
+ 
+   /** 1011 d010            INC.W dest */
++  CYC_K (1);
+ 
+   v = get_reg (d ? a1 : a0);
+   tprintf("%x ++ = %x\n", v, v+1);
+@@ -724,31 +806,46 @@
+   put_reg (d ? a1 : a0, v);
+ 
+   /** 1110 1011 11vector   INT #imm */
++  CYC_K (19);
+ 
+   trigger_based_interrupt (vector);
+ 
+   /** 1111 0110            INTO */
++  CYC_K (1);
+ 
+   if (FLAG_O)
+-    trigger_fixed_interrupt (0xffe0);
++    {
++      CYC_EXTRA (19);
++      trigger_fixed_interrupt (0xffe0);
++    }
+ 
+   /** 0110 1cnd            Jcnd label */
++  CYC_K (2);
+ 
+   v = sign_ext (IMM(0), 8);
+   if (condition_true (cnd))
+-    put_reg (pc, orig_pc + 1 + v);
++    {
++      CYC_EXTRA (2);
++      put_reg (pc, orig_pc + 1 + v);
++    }
+ 
+   /** 0111 1101 1100 cond  Jcnd label */
++  CYC_K (2);
+ 
+   v = sign_ext (IMM(0), 8);
+   if (condition_true (cond))
+-    put_reg (pc, orig_pc + 2 + v);
++    {
++      CYC_EXTRA (2);
++      put_reg (pc, orig_pc + 2 + v);
++    }
+ 
+   /** 0110 0dsp            JMP.S label */
++  CYC_K (5);
+ 
+   put_reg (pc, orig_pc + 2 + dsp);
+ 
+   /** 1111 1110            JMP.B label */
++  CYC_K (4);
+ 
+   imm = sign_ext (IMM(0), 8);
+   if (imm == -1)
+@@ -760,16 +857,19 @@
+   put_reg (pc, orig_pc + 1 + imm);
+ 
+   /** 1111 0100            JMP.W label */
++  CYC_K (4);
+ 
+   imm = sign_ext (IMM(1), 16);
+   put_reg (pc, orig_pc + 1 + imm);
+ 
+   /** 1111 1100            JMP.A label */
++  CYC_K (4);
+   
+   imm = IMM(2);
+   put_reg (pc, imm);
+ 
+   /** 0111 1101 0010 srcx  JMPI.W src */
++  CYC_RM (7, 11);
+ 
+   sc = decode_jumpdest (srcx, 1);
+   a = get_src (sc);
+@@ -777,12 +877,14 @@
+   put_reg (pc, orig_pc + a);
+ 
+   /** 0111 1101 0000 srcx  JMPI.A src */
++  CYC_RM (6, 10);
+ 
+   sc = decode_jumpdest (srcx, 0);
+   a = get_src (sc);
+   put_reg (pc, a);
+ 
+   /** 1110 1110            JMPS #IMM8 */
++  CYC_K (9);
+ 
+   M16C_ONLY();
+ 
+@@ -791,6 +893,7 @@
+   put_reg (pc, a);
+ 
+   /** 1111 0101            JSR.W label */
++  CYC_K (8);
+ 
+   imm = sign_ext (IMM(1), 16);
+   put_reg (sp, get_reg (sp) - 3);
+@@ -798,6 +901,7 @@
+   put_reg (pc, orig_pc + imm + 1);
+ 
+   /** 1111 1101            JSR.A label */
++  CYC_K (9);
+ 
+   imm = IMM(2);
+   put_reg (sp, get_reg (sp) - 3);
+@@ -805,6 +909,7 @@
+   put_reg (pc, imm);
+ 
+   /** 0111 1101 0011 srcx  JSRI.W src */
++  CYC_RM (11, 15);
+ 
+   sc = decode_jumpdest (srcx, 1);
+   a = get_src (sc);
+@@ -815,6 +920,7 @@
+   put_reg (pc, orig_pc + a);
+ 
+   /** 0111 1101 0001 srcx  JSRI.A src */
++  CYC_RM (11, 15);
+ 
+   sc = decode_jumpdest (srcx, 0);
+   a = get_src (sc);
+@@ -824,6 +930,7 @@
+   put_reg (pc, a);
+ 
+   /** 1110 1111            JSRS #IMM8 */
++  CYC_K (13);
+ 
+   M16C_ONLY();
+ 
+@@ -835,12 +942,14 @@
+   put_reg (pc, a);
+ 
+   /** 1110 1011 0reg 0000  LDC #IMM16,dest */
++  CYC_K (2);
+ 
+   dc = decode_cr (reg);
+   imm = IMM(1);
+   put_dest (dc, imm);
+ 
+   /** 0111 1010 1reg srcx  LDC src,dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_cr (reg);
+   sc = decode_srcdest4 (srcx,1);
+@@ -850,7 +959,12 @@
  
    NOTYET();
  
@@ -820,9 +1477,11 @@
 +     "lde.w table[a0],r0 ; jeq done".  */
 +
    /** 0111 010w 1000 dest  LDE.size abs20,dest */
++  CYC_RM (4, 5);
  
    dc = decode_srcdest4 (dest, w);
-@@ -858,6 +876,7 @@
+   imm = IMM(2);
+@@ -858,9 +972,11 @@
      v = mem_get_hi (imm);
    else
      v = mem_get_qi (imm);
@@ -830,7 +1489,11 @@
    put_dest (dc, v);
  
    /** 0111 010w 1001 dest  LDE.size dsp:20[a0], dest */
-@@ -868,16 +887,18 @@
++  CYC_RM (4, 5);
+ 
+   dc = decode_srcdest4 (dest, w);
+   imm = IMM(2) + get_reg (a0);
+@@ -868,23 +984,28 @@
      v = mem_get_hi (imm);
    else
      v = mem_get_qi (imm);
@@ -839,6 +1502,7 @@
  
    /** 0111 010w 1010 dest  LDE.size [a1a0],dest */
 -  
++  CYC_RM (4, 5);
 +
    dc = decode_srcdest4 (dest, w);
    imm = get_reg (a1a0);
@@ -850,8 +1514,132 @@
    put_dest (dc, v);
  
    /** 0111 1101 1010 0imm  LDIPL #IMM */
-@@ -1034,6 +1055,10 @@
++  CYC_K (2);
+ 
+   set_flags (0x700, imm*0x100);
+ 
+   /** 0111 010w 1100 dest  MOV.size:G #IMM,dest */
++  CYC_RM (2, 3);
+ 
+   dc = decode_srcdest4 (dest, w);
+   imm = IMM(w);
+@@ -894,6 +1015,7 @@
+   put_dest (dc, v);
+ 
+   /** 1101 100w immm dest  MOV.size:Q #IMM,dest */
++  CYC_RM (1, 2);
+ 
+   dc = decode_srcdest4 (dest, w);
+   v = sign_ext (immm, 4);
+@@ -902,6 +1024,7 @@
+   put_dest (dc, v);
+ 
+   /** 1100 0dst            MOV.B:S #IMM8,dest */
++  CYC_RM (1, 2);
+ 
+   imm = IMM(0);
+   dc = decode_dest3 (dst, 0);
+@@ -911,6 +1034,7 @@
+   put_dest (dc, v);
+ 
+   /** 1w10 d010            MOV.size:S #IMM,dest */
++  CYC_K (w ? 2 : 1);
+ 
+   /* Note that for w, 0=W and 1=B unlike the usual meaning.  */
+   v = IMM(1-w);
+@@ -919,6 +1043,7 @@
+   put_reg (d ? a1 : a0, v);
+ 
+   /** 1011 0dst            MOV.B:Z #0,dest */
++  CYC_RM (1, 2);
+ 
+   dc = decode_dest3 (dst, 0);
+   v = 0;
+@@ -926,6 +1051,7 @@
+   put_dest (dc, v);
+ 
+   /** 0111 001w srcx dest  MOV.size:G src,dest */
++  CYC_SRC (2);
+ 
+   sc = decode_srcdest4 (srcx, w);
+   dc = decode_srcdest4 (dest, w);
+@@ -934,6 +1060,7 @@
+   put_dest (dc, v);
+ 
+   /** 0011 0d sr           MOV.B:S src,dest */
++  CYC_RM (2, 3);
+ 
+   sc = decode_src2 (sr, 0, d);
+   v = get_src (sc);
+@@ -941,6 +1068,7 @@
+   put_reg (d ? a1 : a0, v);
+ 
+   /** 0000 0s ds           MOV.B:S R0L/R0H,dest */
++  CYC_K (2);
+ 
+   if (ds == 0)
+     UNSUPPORTED();
+@@ -950,6 +1078,7 @@
+   put_dest (dc, v);
+ 
+   /** 0000 1d sr           MOV.B:S src,R0L/R0H */
++  CYC_RM (2, 3);
+ 
+   sc = decode_src2 (sr, 0, d);
+   v = get_src (sc);
+@@ -957,6 +1086,7 @@
+   put_reg (d ? r0h : r0l, v);
+ 
+   /** 0111 010w 1011 dest  MOV.size:G dsp:8[SP], dest */
++  CYC_RM (2, 3);
+ 
+   dc = decode_srcdest4 (dest, w);
+   imm = IMM(0);
+@@ -970,6 +1100,7 @@
+   put_dest (dc, v);
+ 
+   /** 0111 010w 0011 srcx  MOV.size:G src, disp8[SP] */
++  CYC_RM (3, 4);
+ 
+   sc = decode_srcdest4 (srcx, w);
+   imm = IMM(0);
+@@ -983,6 +1114,7 @@
+   set_sz (v, w+1);
+ 
+   /** 1110 1011 0reg 1src  MOVA src,dest */
++  CYC_K (2);
+ 
+   {
+   static reg_id map[] = { r0, r1, r2, r3, a0, a1, 0, 0 };
+@@ -991,6 +1123,7 @@
+   }
+ 
+   /** 0111 1100 10hl dest  MOVdir R0L,dest */
++  CYC_RM (hl == 0 || hl == 3 ? 4 : 7, hl == 0 || hl == 3 ? 5 : 8);
+ 
+   if (dest == 0 || dest == 4 || dest == 5)
+     UNSUPPORTED();
+@@ -1007,6 +1140,7 @@
+   put_dest (dc, a);
+ 
+   /** 0111 1100 00hl srcx  MOVdir src,R0L */
++  CYC_RM (hl == 0 || hl == 3 ? 3 : 6, hl == 0 || hl == 3 ? 5 : 8);
+ 
+   if (srcx == 0 || srcx == 4 || srcx == 5)
+     UNSUPPORTED();
+@@ -1023,6 +1157,7 @@
+   put_reg (r0l, a);
+ 
+   /** 0111 110w 0101 dest  MUL.size #IMM,dest */
++  CYC_RM (w ? 5 : 4, w ? 7 : 5);
+ 
+   UNARY_SOP;
+   imm = sign_ext (IMM(w), w?16:8);
+@@ -1032,14 +1167,20 @@
+   put_dest (dc, v);
+ 
    /** 0111 100w srcx dest  MUL.size src,dest */
++  CYC_MUL (w);
  
    BINARY_SOP;
 +  sc = narrow_areg (sc);
@@ -861,8 +1649,18 @@
    v = a * b;
    tprintf("%d * %d = %d\n", a, b, v);
    dc = widen_sd (dc);
-@@ -1051,6 +1076,10 @@
+   put_dest (dc, v);
+ 
+   /** 0111 110w 0100 dest  MULU.size #IMM,dest */
++  CYC_RM (w ? 5 : 4, w ? 7 : 5);
+ 
+   UNARY_UOP;
+   imm = IMM(w);
+@@ -1049,14 +1190,20 @@
+   put_dest (dc, v);
+ 
    /** 0111 000w srcx dest  MULU.size src,dest */
++  CYC_MUL (w);
  
    BINARY_UOP;
 +  sc = narrow_areg (sc);
@@ -872,7 +1670,183 @@
    v = a * b;
    tprintf("%u * %u = %u\n", a, b, v);
    dc = widen_sd (dc);
-@@ -1258,9 +1287,9 @@
+   put_dest (dc, v);
+ 
+   /** 0111 010w 0101 dest  NEG.size dest */
++  CYC_RM (1, 3);
+ 
+   UNARY_SOP;
+   tprintf("%d * -1 = %d\n", v, -v);
+@@ -1065,10 +1212,12 @@
+   put_dest (dc, v);
+ 
+   /** 0000 0100            NOP */
++  CYC_K (1);
+ 
+   tprintf("nop\n");
+ 
+   /** 0111 010w 0111 dest  NOT.size:G */
++  CYC_RM (1, 3);
+ 
+   UNARY_UOP;
+   tprintf("~ %x = %x\n", v, ~v);
+@@ -1077,6 +1226,7 @@
+   put_dest (dc, v);
+ 
+   /** 1011 1dst            NOT.B:S dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_dest3 (dst, 0);
+   v = get_src (dc);
+@@ -1086,6 +1236,7 @@
+   put_dest (dc, v);
+ 
+   /** 0111 011w 0011 dest  OR.size:G #IMM,dest */
++  CYC_RM (2, 4);
+ 
+   UNARY_UOP;
+   imm = IMM(w);
+@@ -1095,6 +1246,7 @@
+   put_dest (dc, v);
+ 
+   /** 1001 1dst            OR.B:S #IMM8,dest */
++  CYC_RM (1, 3);
+ 
+   imm = IMM(0);
+   dc = decode_dest3 (dst, 0);
+@@ -1105,6 +1257,7 @@
+   put_dest (dc, v);
+ 
+   /** 1001 100w srcx dest  OR.size:G src,dest */
++  CYC_SD (2);
+ 
+   BINARY_UOP;
+   tprintf ("%x | %x = %x\n", a, b, a | b);
+@@ -1113,6 +1266,7 @@
+   put_dest (dc, v);
+ 
+   /** 0001 1d sr           OR.B:S src,R0L/R0H */
++  CYC_RM (2, 3);
+ 
+   sc = decode_src2 (sr, 0, d);
+   dc = decode_dest1 (d, 0);
+@@ -1124,6 +1278,7 @@
+   put_dest (dc, v);
+ 
+   /** 0111 010w 1101 dest  POP.size:G dest */
++  CYC_RM (3, 4);
+ 
+   dc = decode_srcdest4 (dest, w);
+   if (w)
+@@ -1141,6 +1296,7 @@
+   put_dest (dc, v);
+ 
+   /** 1001 d010            POP.B:S dest */
++  CYC_K (3);
+ 
+   v = mem_get_qi (get_reg (sp));
+   put_reg (d ? r0h : r0l, v);
+@@ -1148,6 +1304,7 @@
+   tprintf("popqi: %x\n", v);
+ 
+   /** 1101 d010            POP.W:S dest */
++  CYC_K (3);
+ 
+   v = mem_get_hi (get_reg (sp));
+   put_reg (d ? a1 : a0, v);
+@@ -1155,6 +1312,7 @@
+   tprintf("pophi: %x\n", v);
+ 
+   /** 1110 1011 0reg 0011  POPC dest */
++  CYC_K (3);
+ 
+   dc = decode_cr (reg);
+   v = mem_get_hi (get_reg (sp));
+@@ -1163,11 +1321,15 @@
+   tprintf("popc: %x\n", v);
+ 
+   /** 1110 1101            POPM dest */
++  CYC_K (0);
+ 
+   {
+   static int map[] = { r0, r1, r2, r3, a0, a1, sb, fb };
+   imm = IMM(0);
+   tprintf("popm: %x\n", imm);
++  for (a = 0, v = 0; a < 8; a++)
++    v += (imm >> a) & 1;
++  CYC_EXTRA (v > 1 ? 2 * v : 3);
+   for (a=0; a<8; a++)
+     if (imm & (1<<a))
+       {
+@@ -1178,6 +1340,7 @@
+   }
+ 
+   /** 0111 110w 1110 0010  PUSH.size:G #IMM */
++  CYC_K (2);
+ 
+   imm = IMM(w);
+   if (w)
+@@ -1194,6 +1357,7 @@
+     }
+ 
+   /** 0111 010w 0100 srcx  PUSH.size:G src */
++  CYC_RM (2, 4);
+ 
+   sc = decode_srcdest4 (srcx, w);
+   v = get_src (sc);
+@@ -1211,6 +1375,7 @@
+     }
+ 
+   /** 1000 s010            PUSH.B:S src */
++  CYC_K (2);
+ 
+   v = get_reg (s ? r0h : r0l);
+   put_reg (sp, get_reg (sp) - 1);
+@@ -1218,6 +1383,7 @@
+   tprintf("pushqi: %x\n", v);
+ 
+   /** 1100 s010            PUSH.W:S src */
++  CYC_K (2);
+ 
+   v = get_reg (s ? a1 : a0);
+   put_reg (sp, get_reg (sp) - 2);
+@@ -1225,6 +1391,7 @@
+   tprintf("pushhi: %x\n", v);
+ 
+   /** 0111 1101 1001 srcx  PUSHA src */
++  CYC_K (2);
+ 
+   sc = decode_srcdest4 (srcx, 0);
+   put_reg (sp, get_reg (sp) - 2);
+@@ -1232,6 +1399,7 @@
+   tprintf("pushhi: %x\n", sc.u.addr);
+ 
+   /** 1110 1011 0src 0010  PUSHC src */
++  CYC_K (2);
+ 
+   sc = decode_cr (src);
+   put_reg (sp, get_reg (sp) - 2);
+@@ -1240,11 +1408,15 @@
+   tprintf("pushc: %x\n", v);
+ 
+   /** 1110 1100            PUSHM src */
++  CYC_K (0);
+ 
+   {
+   static int map[] = { fb, sb, a1, a0, r3, r2, r1, r0 };
+   imm = IMM(0);
+   tprintf("pushm: %x\n", imm);
++  for (a = 0, v = 0; a < 8; a++)
++    v += (imm >> a) & 1;
++  CYC_EXTRA (2 * v);
+   for (a=0; a<8; a++)
+     if (imm & (1<<a))
+       {
+@@ -1255,17 +1427,19 @@
+   }
+ 
+   /** 1111 1011            REIT */
++  CYC_K (6);
  
    a = get_reg (sp);
    v = (mem_get_hi (a)
@@ -884,9 +1858,305 @@
    put_reg (pc, v);
    put_reg (flags, b);
    put_reg (sp, get_reg (sp) + 4);
+ 
+   /** 0111 110w 1111 0001  RMPA.size */
++  CYC_K (w ? 6 : 4);
+ 
+   {
+   int count = get_reg (r3);
+@@ -1273,6 +1447,8 @@
+   int list2 = get_reg (a1);
+   int sum = get_reg (w ? r2r0 : r0);
+ 
++  CYC_EXTRA ((w ? 9 : 7) * count);
++
+   while (count)
+     {
+       if (w)
+@@ -1299,37 +1475,44 @@
+   }
+ 
+   /** 0111 011w 1010 dest  ROLC.size dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_srcdest4 (dest, w);
+   rot_op (dc, 1, 1);
+ 
+   /** 0111 011w 1011 dest  RORC.size dest */
++  CYC_RM (1, 3);
+ 
+   dc = decode_srcdest4 (dest, w);
+   rot_op (dc, 1, -1);
+ 
+   /** 1110 000w immm dest  ROT.size #IMM,dest */
++  CYC_RM (1, 2);
+ 
+   dc = decode_srcdest4 (dest, w);
+   rot_op (dc, 0, IMM4());
+ 
+   /** 0111 010w 0110 dest  ROT.size R1H,dest */
++  CYC_RM (2, 3);
+ 
+   dc = decode_srcdest4 (dest, w);
+   rot_op (dc, 0, sign_ext (get_reg (r1h), 8));
+ 
+   /** 1111 0011            RTS */
++  CYC_K (6);
+ 
+   put_reg (pc, mem_get_psi (get_reg (sp)));
+   put_reg (sp, get_reg (sp) + 3);
+ 
+   /** 0111 011w 0111 dest  SBB.size #IMM,dest */
++  CYC_RM (2, 4);
+ 
+   dc = decode_srcdest4 (dest, w);
+   imm = IMM(w);
+   MATH_OP (dc, imm, !carry, -, >= 0);
+ 
+   /** 1011 100w srcx dest  SBB.size src,dest */
++  CYC_SD (2);
+ 
+   sc = decode_srcdest4(srcx, w);
+   dc = decode_srcdest4(dest, w);
+@@ -1337,50 +1520,59 @@
+   MATH_OP (dc, b, !carry, -, >= 0);
+ 
+   /** 1111 000w immm dest  SHA.size #IMM, dest */
++  CYC_RM (1, 2);
+ 
+   dc = decode_srcdest4(dest, w);
+   shift_op (dc, 1, IMM4());
+ 
+   /** 0111 010w 1111 dest  SHA.size R1H,dest */
++  CYC_RM (2, 3);
+ 
+   dc = decode_srcdest4(dest, w);
+   a = sign_ext (get_reg (r1h), 8);
+   shift_op (dc, 1, a);
+ 
+   /** 1110 1011 101d immm  SHA.L #IMM, dest */
++  CYC_K (3);
+ 
+   dc = reg_sd (d ? r3r1 : r2r0);
+   shift_op (dc, 1, IMM4());
+ 
+   /** 1110 1011 001d 0001  SHA.L R1H,dest */
++  CYC_K (4);
+ 
+   dc = reg_sd (d ? r3r1 : r2r0);
+   a = sign_ext (get_reg (r1h), 8);
+   shift_op (dc, 1, a);
+ 
+   /** 1110 100w immm dest  SHL.size #IMM, dest */
++  CYC_RM (1, 2);
+ 
+   dc = decode_srcdest4(dest, w);
+   shift_op (dc, 0, IMM4());
+ 
+   /** 0111 010w 1110 dest  SHL.size R1H,dest */
++  CYC_RM (2, 3);
+ 
+   dc = decode_srcdest4(dest, w);
+   a = sign_ext (get_reg (r1h), 8);
+   shift_op (dc, 0, a);
+ 
+   /** 1110 1011 100d immm  SHL.L #IMM,dest */
++  CYC_K (3);
+ 
+   dc = reg_sd (d ? r3r1 : r2r0);
+   shift_op (dc, 0, IMM4());
+ 
+   /** 1110 1011 000d 0001  SHL.L R1H,dest */
++  CYC_K (4);
+ 
+   dc = reg_sd (d ? r3r1 : r2r0);
+   a = sign_ext (get_reg (r1h), 8);
+   shift_op (dc, 0, a);
+ 
+   /** 0111 110w 1110 100b  SMOVB.size */
++  CYC_K (5);
+ 
+   {
+   int count = get_reg (r3);
+@@ -1388,6 +1580,8 @@
+   int s2 = get_reg (a1);
+   int inc = (w ? 2 : 1) * (b ? -1 : 1);
+ 
++  CYC_EXTRA (5 * count);
++
+   while (count)
+     {
+       if (w)
+@@ -1411,12 +1605,15 @@
+   }
+ 
+   /** 0111 110w 1110 1010  SSTR.size */
++  CYC_K (3);
+ 
+   {
+   int count = get_reg (r3);
+   int s1 = get_reg (a1);
+   v = get_reg (w ? r0 : r0l);
+ 
++  CYC_EXTRA (2 * count);
++
+   while (count)
+     {
+       if (w)
+@@ -1436,12 +1633,14 @@
+   }
+ 
+   /** 0111 1011 1src dest  STC src,dest */
++  CYC_RM (1, 2);
+ 
+   dc = decode_srcdest4 (dest, 1);
+   sc = decode_cr (src);
+   put_dest (dc, get_src(sc));
+ 
+   /** 0111 1100 1100 dest  STC PC,dest */
++  CYC_RM (2, 3);
+ 
+   dc = decode_srcdest4 (dest, 1);
+   dc.bytes = 3;
+@@ -1452,6 +1651,7 @@
+   NOTYET();
+ 
+   /** 0111 010w 0000 srcx  STE.size src,abs20 */
++  CYC_RM (3, 4);
+ 
+   sc = decode_srcdest4 (srcx, w);
+   a = IMM(2);
+@@ -1469,6 +1669,7 @@
+     set_sz (v, w+1);
+     
+   /** 0111 010w 0001 srcx  STE.size src,disp20[a0] */
++  CYC_RM (3, 4);
+ 
+   sc = decode_srcdest4 (srcx, w);
+   a = get_reg(a0) + IMM(2);
+@@ -1486,6 +1687,7 @@
+     set_sz (v, w+1);
+ 
+   /** 0111 010w 0010 srcx  STE.size src,[a1a0] */
++  CYC_RM (3, 4);
+ 
+   sc = decode_srcdest4 (srcx, w);
+   a = get_reg(a1a0);
+@@ -1503,20 +1705,29 @@
+     set_sz (v, w+1);
+ 
+   /** 1101 0dst            STNZ #IMM8,dest */
++  CYC_RM (1, 2);
+ 
+   imm = IMM(0);
+   dc = decode_dest3(dst, 0);
+   if (!FLAG_Z)
+-    put_dest (dc, imm);
++    {
++      CYC_EXTRA (1);
++      put_dest (dc, imm);
++    }
+ 
+   /** 1100 1dst            STZ #IMM8,dest */
++  CYC_RM (1, 2);
+ 
+   imm = IMM(0);
+   dc = decode_dest3(dst, 0);
+   if (FLAG_Z)
+-    put_dest (dc, imm);
++    {
++      CYC_EXTRA (1);
++      put_dest (dc, imm);
++    }
+ 
+   /** 1101 1dst            STZX #IMM81,#IMM82,dest */
++  CYC_RM (2, 3);
+ 
+   a = IMM(0);
+   dc = decode_dest3(dst, 0);
+@@ -1527,18 +1738,21 @@
+     put_dest (dc, b);
+ 
+   /** 0111 011w 0101 dest  SUB.size:G #IMM,dest */
++  CYC_RM (2, 4);
+ 
+   dc = decode_srcdest4 (dest, w);
+   imm = IMM(w);
+   MATH_OP (dc, imm, 0, -, >= 0);
+ 
+   /** 1000 1dst            SUB.B:S #IMM8,dest */
++  CYC_RM (1, 3);
+ 
+   imm = IMM(0);
+   dc = decode_dest3 (dst, 0);
+   MATH_OP (dc, imm, 0, -, >= 0);
+ 
+   /** 1010 100w srcx dest  SUB.size:G src,dest */
++  CYC_SD (2);
+ 
+   sc = decode_srcdest4(srcx, w);
+   dc = decode_srcdest4(dest, w);
+@@ -1546,6 +1760,7 @@
+   MATH_OP (dc, b, 0, -, >= 0);
+ 
+   /** 0010 1d sr           SUB.B:S src,R0L/R0H */
++  CYC_RM (2, 3);
+ 
+   sc = decode_src2 (sr, 0, d);
+   dc = decode_dest1 (d, 0);
+@@ -1553,6 +1768,7 @@
+   MATH_OP (dc, b, 0, -, >= 0);
+ 
+   /** 0111 011w 0000 dest  TST.size #IMM, dest */
++  CYC_RM (2, 4);
+ 
+   UNARY_UOP;
+   imm = IMM(w);
+@@ -1561,6 +1777,7 @@
+   set_sz (v, w+1);
+ 
+   /** 1000 000w srcx dest  TST.size src,dest */
++  CYC_SD (2);
+ 
+   BINARY_UOP;
+   tprintf ("%x & %x = %x\n", a, b, a & b);
+@@ -1568,14 +1785,17 @@
+   set_sz (v, w+1);
+ 
+   /** 1111 1111            UND */
++  CYC_K (20);
+ 
+   trigger_fixed_interrupt (0xffdc);
+ 
+   /** 0111 1101 1111 0011  WAIT */
++  CYC_K (3);
+ 
+   tprintf("waiting...\n");
+ 
+   /** 0111 101w 00sr dest  XCHG.size src,dest */
++  CYC_RM1 (4, 5);
+ 
+   sc = decode_srcdest4 (sr, w);
+   dc = decode_srcdest4 (dest, w);
+@@ -1585,6 +1805,7 @@
+   put_dest (sc, b);
+ 
+   /** 0111 011w 0001 dest  XOR.size #IMM,dest */
++  CYC_RM (2, 4);
+ 
+   UNARY_UOP;
+   imm = IMM(w);
+@@ -1594,6 +1815,7 @@
+   put_dest (dc, v);
+ 
+   /** 1000 100w srcx dest  XOR.size src,dest */
++  CYC_SD (2);
+ 
+   BINARY_UOP;
+   tprintf ("%x ^ %x = %x\n", a, b, a ^ b);
 --- a/sim/m32c/srcdest.c
 +++ b/sim/m32c/srcdest.c
-@@ -24,7 +24,6 @@
+@@ -24,10 +24,65 @@
  #include <stdio.h>
  #include <stdlib.h>
  
@@ -894,7 +2164,74 @@
  #include "cpu.h"
  #include "mem.h"
  
-@@ -129,6 +128,8 @@
++int m32c_cyc_kind, m32c_cyc_p[8], m32c_cyc_extra;
++int m32c_cyc_mode[4], m32c_cyc_nmode;
++
++/* Note the addressing mode of an operand the instruction has just decoded,
++   as a column of the manual's cycle tables.  */
++void
++m32c_cyc_note (int code)
++{
++  static const unsigned char col[16] =
++    { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7 };
++  if (m32c_cyc_nmode < 4)
++    m32c_cyc_mode[m32c_cyc_nmode++] = col[code & 15];
++}
++
++/* CPU cycles for the instruction just executed, or 0 if its pattern names no
++   rule.  See cpu.h.  */
++int
++m32c_insn_cpu_cycles (void)
++{
++  int m0 = m32c_cyc_nmode > 0 ? m32c_cyc_mode[0] : 0;
++  int m1 = m32c_cyc_nmode > 1 ? m32c_cyc_mode[1] : 0;
++  int mem0 = m0 >= 2, mem1 = m1 >= 2, c;
++
++  switch (m32c_cyc_kind)
++    {
++    case CYC_KIND_K:
++      c = m32c_cyc_p[0];
++      break;
++    case CYC_KIND_RM:
++      c = mem0 ? m32c_cyc_p[1] : m32c_cyc_p[0];
++      break;
++    case CYC_KIND_RM1:
++      c = mem1 ? m32c_cyc_p[1] : m32c_cyc_p[0];
++      break;
++    case CYC_KIND_SD:
++      c = m32c_cyc_p[0] + mem0 + mem1;
++      break;
++    case CYC_KIND_SRC:
++      c = m32c_cyc_p[0] + mem0;
++      break;
++    case CYC_KIND_T8:
++      c = m32c_cyc_p[m0];
++      break;
++    case CYC_KIND_MUL:
++      /* Rn,Rn 4; An,An 5; register to memory 5; from memory 6.  With .W:
++	 two more into memory, one more into a register unless An to An.  */
++      c = mem0 ? 6 : mem1 ? 5 : (m0 == 1 && m1 == 1) ? 5 : 4;
++      if (m32c_cyc_p[0])
++	c += mem1 ? 2 : (m0 == 1 && m1 == 1) ? 0 : 1;
++      break;
++    default:
++      return 0;
++    }
++  return c + m32c_cyc_extra;
++}
++
+ static int src_indirect = 0;
+ static int dest_indirect = 0;
+ static int src_addend = 0;
+@@ -120,6 +175,7 @@
+ decode_srcdest4 (int destcode, int bw)
+ {
+   srcdest sd;
++  m32c_cyc_note (destcode);
+   static const char *dc_wnames[16] = { "r0", "r1", "r2", "r3",
+     "a0", "a1", "[a0]", "[a1]",
+     "disp8[a0]", "disp8[a1]", "disp8[sb]", "disp8[fb]",
+@@ -129,6 +185,8 @@
  
    sd.bytes = bw ? 2 : 1;
    sd.mem = (destcode >= 6) ? 1 : 0;
@@ -903,7 +2240,14 @@
  
    if (trace)
      {
-@@ -209,6 +210,9 @@
+@@ -203,12 +261,16 @@
+ decode_jumpdest (int destcode, int w)
+ {
+   srcdest sd;
++  m32c_cyc_note (destcode);
+   static const char *dc_wnames[16] = { "r0", "r1", "r2", "r3",
+     "a0", "a1", "[a0]", "[a1]",
+     "disp8[a0]", "disp8[a1]", "disp8[sb]", "disp8[fb]",
      "disp20[a0]", "disp20[a1]", "disp16[sb]", "abs16"
    };
    static const char *dc_anames[4] = { "r0l", "r0h", "r1l", "r1h" };
@@ -913,7 +2257,7 @@
  
    sd.bytes = w ? 2 : 3;
    sd.mem = (destcode >= 6) ? 1 : 0;
-@@ -264,9 +268,11 @@
+@@ -264,9 +326,11 @@
        break;
      case 0xc:
        sd.u.addr = get_reg (a0) + disp20 ();
@@ -925,7 +2269,7 @@
        break;
      case 0xe:
        sd.u.addr = get_reg (sb) + disp16 ();
-@@ -278,7 +284,7 @@
+@@ -278,7 +342,7 @@
        abort ();
      }
    if (sd.mem)
@@ -934,7 +2278,7 @@
    return sd;
  }
  
-@@ -487,6 +493,7 @@
+@@ -487,6 +551,7 @@
    static int regcode[] = { 0, intbl, intbh, flags, isp, sp, sb, fb };
    srcdest sd;
    sd.mem = 0;
@@ -942,7 +2286,7 @@
    sd.bytes = 2;
    sd.u.reg = regcode[crcode & 7];
    return sd;
-@@ -503,6 +510,7 @@
+@@ -503,6 +568,7 @@
    };
    srcdest sd;
    sd.mem = 0;
@@ -950,7 +2294,7 @@
    sd.bytes = bank ? 3 : 2;
    sd.u.reg = regcode[bank][crcode & 7];
    return sd;
-@@ -512,6 +520,7 @@
+@@ -512,6 +578,7 @@
  widen_sd (srcdest sd)
  {
    sd.bytes *= 2;
@@ -958,7 +2302,7 @@
    if (!sd.mem)
      switch (sd.u.reg)
        {
-@@ -528,7 +537,11 @@
+@@ -528,7 +595,11 @@
  	sd.u.reg = r3r1;
  	break;
        case a0:
@@ -971,7 +2315,7 @@
  	  sd.u.reg = a1a0;
  	break;
        default:
-@@ -543,6 +556,7 @@
+@@ -543,6 +614,7 @@
    srcdest rv;
    rv.bytes = reg_bytes[reg];
    rv.mem = 0;
@@ -979,7 +2323,7 @@
    rv.u.reg = reg;
    return rv;
  }
-@@ -574,6 +588,13 @@
+@@ -574,6 +646,13 @@
    else
      {
        v = get_reg (sd.u.reg);
@@ -993,7 +2337,7 @@
        switch (sd.bytes)
  	{
  	case 1:
-@@ -613,6 +634,11 @@
+@@ -613,6 +692,11 @@
      }
    else
      {
@@ -1005,7 +2349,15 @@
        switch (sd.bytes)
  	{
  	case 1:
-@@ -691,7 +717,13 @@
+@@ -634,6 +718,7 @@
+ {
+   srcdest sd;
+   int addr = 0;
++  m32c_cyc_note (destcode);
+   static const char *dc_names[] = { "r0", "r1", "r2", "r3",
+     "a0", "a1", "[a0]", "[a1]",
+     "disp8[a0]", "disp8[a1]", "disp8[sb]", "disp8[fb]",
+@@ -691,7 +776,13 @@
        addr = get_reg (a1) + disp16 ();
        break;
      case 14:

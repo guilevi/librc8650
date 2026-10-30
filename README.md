@@ -215,8 +215,7 @@ in a way that is easy to get wrong. Once speech is running the D/A is written
 on every tick of the sample clock without exception — measured across sixty
 utterances covering every voice, both speed scales, all sixteen punctuation
 modes, maximum word delay and reverb, as a gap of never more than 206
-instructions under the old clock model; under timer A3 a tick is 737 cycles, 184
-instructions at the simulator's four cycles each — so there is no such thing as
+instructions under the old clock and timing model — so there is no such thing as
 a pause in the middle of speech. But the chip can pause for up to 149k instructions in the middle of
 *starting*: it emits a short burst, then finishes its letter-to-sound work, then
 speaks the body. Any quiet threshold responsive enough to end an utterance is
@@ -329,6 +328,37 @@ real clock divides by 737, so at the default formant the chip runs at
 documented; output samples are spaced at the real default period, and a caller
 that wants to be exact can treat the stream as 10,003.8 Hz.
 
+### Instruction timing
+
+The emulated CPU is charged what the M16C software manual says each instruction
+costs - chapter 4's cycle count for that instruction and those addressing modes,
+plus the extras its notes give for a branch taken, a shift count, a string
+length or a register list, and 18 cycles to enter an interrupt (table 5.3.1).
+The firmware runs the CPU at half the crystal (CM1 = 0x40, main clock divided
+by two) while the timers count the full 7.3728 MHz, and the timers advance by
+cycles times that divider. The simulator used to charge every instruction a flat
+four timer cycles; for the musical generator's loop that was about half the
+real cost.
+
+Speech, DTMF and the sinusoidal generator render byte for byte as before: they
+are computed into a buffer the DMA drains on the sample clock, so timing moves
+only when things happen, not what is produced. What it does move: index markers
+arrive a few samples later, the moment the firmware switches the sample clock
+for a formant or playback-rate change shifts by a sample or so, and anything
+the firmware times with code - the musical generator - is now in time.
+
+Two things the counts leave out: the instruction queue, which a taken branch
+empties and which the manual's counts assume is full, and the cycles a DMA
+transfer takes from the CPU. Patterns the simulator does not implement
+(LDCTX, STCTX) and the M32C decoder fall back to the old flat charge.
+
+D/A writes the CPU makes itself are rendered by time: the D/A holds each level
+until the next write, and an output sample is that level averaged over its
+period. Only once such writes are sustained - sixteen without a DMA sample
+between - since speech opens with two CPU writes before the DMA takes over, and
+rendering the gap between them put nine samples of silence in front of every
+first utterance.
+
 ### Limits worth knowing
 
 - **One engine per process.** The emulator core keeps file-scope state, so a
@@ -355,20 +385,18 @@ too), the formant setting and real-time PCM playback all come out right. A 500 H
 tone sent with `78#` comes back at 499.5 Hz; until the sample clock was found
 (see "Sample rate") the playback rate was ignored and it came back at 625. These
 do not:
-- **The musical tone generator (`J`) plays, but at the wrong pitch and tempo.**
-  It used to be silent and wedge the chip, because it checks SUSP0# (P7.7) in
-  software and waits while it is low, and the emulation left the pin low; it is
-  now tied high, as the datasheet asks of an unused one. The generator itself is
-  a cycle-counted loop running from RAM: three voice counters, a pulse written to
-  the D/A when one runs out, and a calibrated busy-wait, with one pass designed
-  to take 1/16,768 s, about 440 cycles - which is where the datasheet's
-  fi = 16,768 / Ki comes from. Two things stand between that and the right
-  pitch. The simulator charges every instruction four cycles, so a pass of 62
-  instructions costs 248 cycles instead of 440; and the library spaces D/A
-  writes by the sample clock, which is right for DMA output and wrong for writes
-  made from code, whose pulses are a few dozen microseconds wide. The fix is
-  per-instruction cycle counts (the software manual's chapter 4 lists them) and
-  rendering the D/A by time rather than by write.
+- **The musical tone generator (`J`) plays about 2.5% sharp.** Middle C
+  (Ki = 64) comes out at 268.5 Hz against the datasheet's 262; A at 451 against
+  441; low C at 67.5 against 65.8. The generator is a cycle-counted loop running
+  from RAM - three voice counters, a pulse written to the D/A when one runs out,
+  a calibrated busy-wait - with one pass designed to take 1/16,768 s, which is
+  where fi = 16,768 / Ki comes from. Its pitch and tempo are therefore only as
+  good as the instruction timing (see "Instruction timing"), and what that leaves
+  out is the instruction queue: the manual's counts assume it is full, and a
+  taken branch empties it. That is the likeliest source of the 2.5%. It used to
+  be silent and wedge the chip, because it checks SUSP0# (P7.7) in software and
+  waits while it is low, and the emulation left the pin low; it is now tied high,
+  as the datasheet asks of an unused one.
 - **Digital audio output (`nN` with ACR.7 set) produces nothing.** The firmware
   points DMA0 at U1TB (`0x3AA`) with request source 15, UART1 transmit, which the
   simulator does not model, so speech stops at the first sample. The library
