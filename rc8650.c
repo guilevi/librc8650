@@ -388,6 +388,10 @@ hook_rx (unsigned char *b)
     return 0;			/* nothing queued: not EOF, just idle */
   *b = e->in[e->in_tail];
   e->in_tail = (e->in_tail + 1) % e->in_cap;
+  /* The chip taking input is progress as much as a sample is: it bounds the
+     give-up rule in step_and_track by what the chip is doing, not by what the
+     host happens to have queued. */
+  e->thinking = 0;
   return 1;
 }
 
@@ -1047,11 +1051,11 @@ step_and_track (rc8650_t *e)
       if (e->heard >= HEARD_ENOUGH)
 	{
 	  e->thinking = 0;
-	  /* Stuck asserted with nothing coming out.  The musical tone
-	     generator has been seen to leave TS high after its Quit frame, and
-	     a forced-high pin never falls at all.  This costs nothing during
-	     real output, where the D/A is written every 206 instructions
-	     without exception. */
+	  /* Stuck asserted with nothing coming out: a forced-high pin never
+	     falls at all.  (The musical tone generator also leaves TS high, but
+	     it never gets past HEARD_ENOUGH, so it is the idle budget below that
+	     ends it.)  This costs nothing during real output, where the D/A is
+	     written every 206 instructions without exception. */
 	  if (e->since_sample > QUIET_INSNS)
 	    e->work = 0;
 	  return;
@@ -1076,7 +1080,16 @@ step_and_track (rc8650_t *e)
       return;
     }
 
-  if (RING_EMPTY (e, in) && e->thinking > THINK_CAP)
+  /* Nothing out and nothing taken in for THINK_CAP: the chip has finished
+     with this work, or will not finish it.  This must not wait for the input
+     queue to drain.  After the musical tone generator's Quit frame the chip
+     holds CTS# high until it has played the buffer, and the emulation never
+     plays it (128 samples, see notes.md), so bytes stay queued, TS stays high,
+     fewer than HEARD_ENOUGH samples ever arrive, and with the queue as a
+     condition every rule here was blocked: rc8650_read never returned.
+     hook_rx counts a byte taken as progress, so a chip that is reading its
+     input is never given up on. */
+  if (e->thinking > THINK_CAP)
     e->work = 0;
 }
 
