@@ -40,7 +40,8 @@ existing GDB sim build directory instead.
 
 The patch is what makes the stock simulator run this firmware: bare-metal
 operation (the hosted-newlib syscall trap is a false positive on firmware),
-the RC8650 board's peripheral stubs, timer B2 and the D/A write tap, and two
+the RC8650 board's peripheral stubs, the sample clock (timer A3) and the D/A
+write tap, and two
 CPU bugs the firmware trips over — `disp20[a0/a1]` addresses being truncated to
 16 bits, and byte-size operations on `A0`/`A1`, which the M16C computes in 16
 bits rather than 8.
@@ -211,10 +212,12 @@ when it stops, and the stop lands 64 instructions after the final sample:
 
 Without it the library has only silence to work from, and silence is ambiguous
 in a way that is easy to get wrong. Once speech is running the D/A is written
-every 206 instructions without exception — measured across sixty utterances
-covering every voice, both speed scales, all sixteen punctuation modes, maximum
-word delay and reverb — so there is no such thing as a pause in the middle of
-speech. But the chip can pause for up to 149k instructions in the middle of
+on every tick of the sample clock without exception — measured across sixty
+utterances covering every voice, both speed scales, all sixteen punctuation
+modes, maximum word delay and reverb, as a gap of never more than 206
+instructions under the old clock model; under timer A3 a tick is 737 cycles, 184
+instructions at the simulator's four cycles each — so there is no such thing as
+a pause in the middle of speech. But the chip can pause for up to 149k instructions in the middle of
 *starting*: it emits a short burst, then finishes its letter-to-sound work, then
 speaks the body. Any quiet threshold responsive enough to end an utterance is
 shorter than that pause, so the utterance gets declared over during its own
@@ -281,9 +284,30 @@ is what makes cancel-then-speak safe.
 
 ### Sample rate
 
-`RC8650_SAMPLE_RATE` is 10017 Hz — the 7.3728 MHz crystal divided by 8
-(timer B2's `f8` source) and by the timer's reload of 92. Resample if your
-output device needs something else.
+`RC8650_SAMPLE_RATE` is 10017 Hz, and everything the library returns is at that
+one rate. Resample if your output device needs something else.
+
+The chip's own D/A rate is not fixed. Its sample clock is timer A3, which the
+firmware reprograms: the 7.3728 MHz crystal divided by 737 for speech at the
+default formant and for the tone and DTMF generators, by 812 down to 677 across
+the formant settings `0F` to `9F`, and by whatever real-time playback (`n#`,
+`n%`) asks for, from 4 to 11 kHz. The library resamples that to the fixed output
+rate by linear interpolation, using each sample's real duration. At the default
+divider it is a straight copy, so speech at `5F` comes out byte for byte as the
+D/A wrote it.
+
+**The formant setting is a clock change, and nothing else.** That is how the
+chip moves every formant at once: `0F` to `9F` produce the same samples, played
+at 9.08 to 10.89 kHz. So a higher setting is also slightly faster and
+higher-pitched, 9% for `9F` against `5F`. The firmware compensates for neither,
+and the emulation does not either.
+
+**10017 Hz is 0.14% high.** It was taken from timer B5, which the BIOS runs at
+f8/92 for its delay loop and which was long mistaken for the sample clock. The
+real clock divides by 737, so at the default formant the chip runs at
+10,003.8 Hz. That is far below anything audible, so the constant stays as it is
+documented; output samples are spaced at the real default period, and a caller
+that wants to be exact can treat the stream as 10,003.8 Hz.
 
 ### Limits worth knowing
 
@@ -305,19 +329,12 @@ output device needs something else.
 ### What the emulation does not cover
 
 Measured on `rc8650_m4_valid.srec` against the RC8650 datasheet. Speech, the
-DTMF dialer (button 1: 699.5 and 1213 Hz against 697 and 1209) and the
-sinusoidal generator (`95J` dial tone: 445 and 352 Hz against 442 and 351.5;
-`40J` correct too) all come out right. The firmware turns `nJ`'s rate into
-frequencies and durations itself, so the fixed 10017 Hz output is correct for
-them. These do not:
-
-- **Real-time audio playback (`n#`, `n%`) ignores its sampling rate.** The
-  datasheet plays the data at fs = 617 / (155 - n) kHz; the emulation plays one
-  sample per 10017 Hz tick whatever n is. A 500 Hz tone sent with `78#` (8013 Hz)
-  comes back at 625 Hz, which is 500 x 10017 / 8013. The firmware never touches
-  a timer during playback (DMA0 stays on timer B2), so where the rate is meant to
-  be applied is not yet known. Until it is, resample PCM to 10017 Hz on the host
-  before sending it.
+DTMF dialer (button 1: 699.5 and 1213 Hz against 697 and 1209), the sinusoidal
+generator (`95J` dial tone: 445 and 352 Hz against 442 and 351.5; `40J` correct
+too), the formant setting and real-time PCM playback all come out right. A 500 Hz
+tone sent with `78#` comes back at 499.5 Hz; until the sample clock was found
+(see "Sample rate") the playback rate was ignored and it came back at 625. These
+do not:
 - **The musical tone generator (`J`) is silent and wedges the chip.** Even the
   datasheet's own example tune gives 128 samples, and the chip then keeps CTS#
   high, so not even `rc8650_stop`'s CTRL+X gets in. `rc8650_reset` is the only
@@ -331,6 +348,10 @@ them. These do not:
   no API to feed it a signal, so recording has nothing to record.
 - **Prerecorded playback (`n&`)** needs a sound library downloaded with `223W`,
   which is untested.
+- **Timers A0 and A1 are not modelled.** The firmware chains them into a slow
+  timer - A0 overflows about every 130 ms and A1 counts 460 of those, about a
+  minute - with A1's interrupt enabled. It is most likely behind the sleep or
+  timeout features; nothing measured so far depends on it.
 
 ## Licensing — read before shipping
 

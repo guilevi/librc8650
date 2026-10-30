@@ -28,6 +28,7 @@ extern int m32c_baremetal, m32c_rc865x, m32c_p8_or, m32c_extflash_armed;
 extern int (*rc865x_hook_rx) (unsigned char *);
 extern void (*rc865x_hook_tx) (unsigned char);
 extern void (*rc865x_hook_dac) (unsigned char);
+extern int m32c_rc865x_dac_period (void);
 extern int trace, verbose, enable_counting, m32c_p6_driven;
 
 /* Instruction budgets.  These are generous ceilings, not expected costs: the
@@ -54,11 +55,14 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
  *
  * QUIET_INSNS is now only a guard against a stuck TS pin, not the way
  * utterances end.  It is safe in that role because once speech is under way
- * the D/A is written every 206 instructions without exception - measured
- * across sixty utterances covering every voice, both speed scales, all sixteen
- * punctuation modes, maximum word delay and reverb, comma-heavy and
+ * the D/A is written on every tick of the sample clock without exception -
+ * measured across sixty utterances covering every voice, both speed scales,
+ * all sixteen punctuation modes, maximum word delay and reverb, comma-heavy and
  * sentence-heavy text: the longest gap between two samples anywhere was 206
- * instructions.  There is no such thing as a pause in the middle of speech.
+ * instructions under the old clock model.  Timer A3 ticks every 737 cycles at
+ * the default rate, 184 instructions, and real-time playback at 4 kHz stretches
+ * that to about 460.  There is no such thing as a pause in the middle of
+ * speech.
  *
  * Quiet was never the right thing to END on, though, because the chip can go
  * quiet for a long time BEFORE it is finished starting: it emits a short burst
@@ -93,6 +97,21 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
    for the single letter "a").  Under it, THINK_CAP is the backstop, which is
    what covers text the chip declines to speak. */
 #define HEARD_ENOUGH      512UL
+
+/* The D/A runs at whatever rate the firmware programs into timer A3, which is
+   not one rate: the formant setting (nF) moves it between about 9.1 and
+   10.9 kHz - that is how the chip shifts every formant at once - and real-time
+   playback (n#, n%) sets it anywhere from 4 to 11 kHz.  The library delivers
+   one rate, so hook_dac resamples to it.  NOMINAL_PERIOD is the D/A period, in
+   f1 cycles, that output samples are spaced at: TA3 = 736, the value for
+   speech at the default 5F and for the tone and DTMF generators, which divides
+   by 737.  At that period the resampler passes samples through untouched.
+
+   MIN_PERIOD catches the moment before the firmware has programmed TA3 at
+   all, when it reads 0: nothing the chip does runs faster than 11 kHz, which
+   is 670 cycles. */
+#define NOMINAL_PERIOD 737
+#define MIN_PERIOD     512
 
 /* How long rc8650_read_serial keeps the CPU running for a reply that may still
  * be draining after the audio side has gone idle.  See rc8650_read_serial. */
@@ -165,6 +184,10 @@ struct rc8650
   size_t image_len;
   unsigned char *image_srec;
   size_t image_srec_len;
+
+  int rs_have;			/* a D/A sample is held in rs_prev */
+  unsigned char rs_prev;	/* the last D/A sample */
+  long rs_acc;			/* f1 cycles from rs_prev to the next output */
 
   unsigned lowpass_hz;		/* 0 = bypass */
   double b0, b1, b2, a1, a2;	/* biquad coefficients */
@@ -462,18 +485,50 @@ hook_tx (unsigned char b)
   ring_put (e->ser, SER_CAP, &e->ser_head, e->ser_tail, b);
 }
 
+/* One output sample.  Only a stored sample is counted: samples_out is the
+   clock index markers are timestamped against and samples_read chases it one
+   delivery at a time, so a sample counted here but dropped by a full ring
+   would leave every later marker permanently one sample out of reach. */
+static void
+dac_out (rc8650_t *e, unsigned char v)
+{
+  if (ring_put (e->pcm, PCM_CAP, &e->pcm_head, e->pcm_tail, v))
+    e->samples_out++;
+}
+
 static void
 hook_dac (unsigned char v)
 {
   rc8650_t *e = the_engine;
   if (!e)
     return;
-  /* Only a stored sample is counted.  samples_out is the clock index markers
-     are timestamped against and samples_read chases it one delivery at a time,
-     so a sample counted here but dropped by a full ring would leave every
-     later marker permanently one sample out of reach. */
-  if (ring_put (e->pcm, PCM_CAP, &e->pcm_head, e->pcm_tail, v))
-    e->samples_out++;
+  /* Resample to NOMINAL_PERIOD by linear interpolation between this sample
+     and the last, each held for the period now programmed.  An output instant
+     that lands exactly on a D/A sample gets that sample, so at the nominal
+     period - all speech at 5F, and the tone and DTMF generators - this is a
+     straight copy.  It also never waits for a sample that has not arrived,
+     which would hold the last one of every utterance back. */
+  {
+    long p = m32c_rc865x_dac_period ();
+
+    if (p < MIN_PERIOD)
+      p = NOMINAL_PERIOD;
+    if (!e->rs_have)
+      {
+	dac_out (e, v);
+	e->rs_have = 1;
+	e->rs_acc = NOMINAL_PERIOD;
+      }
+    else
+      {
+	for (; e->rs_acc <= p; e->rs_acc += NOMINAL_PERIOD)
+	  dac_out (e, (unsigned char) lround (e->rs_prev
+					      + (v - e->rs_prev)
+					      * (double) e->rs_acc / p));
+	e->rs_acc -= p;
+      }
+    e->rs_prev = v;
+  }
   e->since_sample = 0;
   /* Audio is flowing, so this work item is alive whatever the pins say - that
      keeps THINK_CAP from expiring mid-utterance if TS is ever unavailable. */
@@ -668,6 +723,7 @@ boot (rc8650_t *e, char **err)
   e->work = e->started = e->talking = e->heard = 0;
   e->mark_head = e->mark_tail = 0;
   e->samples_out = e->samples_read = 0;
+  e->rs_have = 0;
 
   /* Run the BIOS and firmware init through to the point where the chip
    * asserts CTS#, so callers get a device that is ready to be spoken to. */
@@ -964,6 +1020,7 @@ rc8650_stop (rc8650_t *e)
   e->mark_head = e->mark_tail = 0;
   e->samples_read = e->samples_out;
   e->pcm_head = e->pcm_tail = 0;
+  e->rs_have = 0;
   /* Whatever the filter was ringing on has just been dropped; carrying its
      state into the next utterance would start it with a click. */
   biquad_reset (e);
@@ -1055,7 +1112,7 @@ step_and_track (rc8650_t *e)
 	     falls at all.  (The musical tone generator also leaves TS high, but
 	     it never gets past HEARD_ENOUGH, so it is the idle budget below that
 	     ends it.)  This costs nothing during real output, where the D/A is
-	     written every 206 instructions without exception. */
+	     written on every sample-clock tick without exception. */
 	  if (e->since_sample > QUIET_INSNS)
 	    e->work = 0;
 	  return;

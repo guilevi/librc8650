@@ -34,7 +34,11 @@
 extern "C" {
 #endif
 
-/* Sample rate of the D/A output: 7.3728 MHz crystal / 8 / 92. */
+/* Sample rate of everything the library returns.  The chip's own D/A rate
+ * moves with the formant setting (nF) and real-time playback (n#, n%); the
+ * library resamples it to this one.  The default D/A rate is the 7.3728 MHz
+ * crystal divided by 737, 10003.8 Hz, so this nominal figure is 0.14% high -
+ * see "Sample rate" in README.md. */
 #define RC8650_SAMPLE_RATE 10017
 
 /* The same value, for callers that reach the library through a shared object

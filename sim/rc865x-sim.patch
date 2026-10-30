@@ -135,7 +135,7 @@
  }
 --- a/sim/m32c/mem.c
 +++ b/sim/m32c/mem.c
-@@ -43,6 +43,167 @@
+@@ -43,6 +43,192 @@
  #include "timer_a.h"
  #endif
  
@@ -201,20 +201,35 @@
 +unsigned long m32c_pcsample = 0;	/* print the PC every n instructions */
 +unsigned long m32c_statedump = 0;	/* dump key RAM every n instructions */
 +
-+/* Timer B2: the speech sample clock.  TB2MR/TB2 are programmed by both the
-+   BIOS and the firmware, TABSR bit 7 starts it, and it drives vector 29.  */
++/* "Timer B2", as this code has always called it, is really timer B5: on the
++   M16C/62 family 0x0340, 0x0354 and 0x035D are TBSR, TB5 and TB5MR, and its
++   request flag is TB5IC at 0x0045.  The BIOS runs it at f8/92 for its delay
++   loop, which happens to be the speech sample rate, and that coincidence is
++   why it was taken for the sample clock.  It is not: see timer_a3.  */
 +static struct
 +{
 +  int count, reload, prescale;
 +  unsigned char mode, bsr, ic;
 +} timer_b2;
 +
++/* Timer A3: the sample clock.  On the M16C/62 DMA request source 5 is timer
++   A3, and the firmware programs TA3 (0x038C) with the D/A period in f1 cycles,
++   less one: 736 for speech, DTMF and the sinusoidal generator, 811 down to 676
++   across the formant settings 0F-9F, and the rate of real-time playback (920
++   for 78#, 1616 for 20#).  TA3MR (0x0399) is 0x1C: timer mode, f1, counting
++   only while TA3IN is high -- a gate that is presumably the SUSPEND pin, taken
++   here as never asserted.  TABSR (0x0380) bit 3 starts it.  */
++static struct
++{
++  int count, reload, cycles, on;
++} timer_a3;
++
 +/* The M16C DMA controller.  DMA0: SAR 0x20, DAR 0x24, TCR 0x28, DM0CON 0x2C,
 +   request select DM0SL 0x3B8; DMA1 the same shape at 0x30/0x34/0x38/0x3C,
 +   DM1SL 0x3BA.  DMxCON: b0 8-bit, b1 repeat, b3 enable, b4 source-forward,
 +   b5 dest-forward.  The firmware's speech playback programs DMA0 as
 +   SAR=sample ring in RAM (forward), DAR=DA0 (fixed), TCR=0x3FF, con=0x1B,
-+   DM0SL=5 -- request source 5 is timer B2, the sample clock (the recording
++   DM0SL=5 -- request source 5 is timer A3, the sample clock (the recording
 +   path uses the same trigger with the A/D result as source).  The playback
 +   wait loop (RAM 0x1231) polls SAR0 until it catches the fill cursor, so the
 +   current source address must be readable back from 0x20.  On repeat-mode
@@ -227,6 +242,16 @@
 +} dma_init[2];
 +
 +static unsigned char *mem_ptr (int address);
++
++/* The D/A period currently programmed, in f1 cycles.  An embedder that wants
++   a fixed output rate resamples by this; it changes with the formant setting
++   and the real-time playback rate.  */
++int
++m32c_rc865x_dac_period (void)
++{
++  static const int div[4] = { 1, 8, 32, 32 };
++  return (timer_a3.reload + 1) * div[*mem_ptr (0x399) >> 6];
++}
 +
 +static unsigned long
 +raw24 (int addr)
@@ -303,7 +328,7 @@
  #define L1_BITS  (10)
  #define L2_BITS  (10)
  #define OFF_BITS (12)
-@@ -213,15 +374,49 @@
+@@ -213,15 +399,49 @@
    m = mem_ptr (address);
    if (trace)
      printf (" %02x", value);
@@ -354,7 +379,7 @@
  	int i;
  	if (old_led != value)
  	  {
-@@ -301,21 +496,73 @@
+@@ -301,21 +521,90 @@
        break;
  
      case 0x400:
@@ -412,6 +437,23 @@
 +	putc (value, m32c_dac_file);
 +      break;
 +
++    case 0x38c:		/* TA3 low */
++    case 0x38d:		/* TA3 high */
++      /* Timer mode: while counting, a write reaches the reload register only
++	 and takes effect at the next underflow.  */
++      timer_a3.reload = *mem_ptr (0x38c) | (*mem_ptr (0x38d) << 8);
++      if (!timer_a3.on)
++	timer_a3.count = timer_a3.reload;
++      break;
++    case 0x380:		/* TABSR - bit 3 is TA3S */
++      if ((value & 0x08) && !timer_a3.on)
++	{
++	  timer_a3.count = timer_a3.reload;
++	  timer_a3.cycles = 0;
++	}
++      timer_a3.on = (value & 0x08) != 0;
++      break;
++
 +    case 0x354:		/* TB2 low */
 +      timer_b2.reload = (timer_b2.reload & 0xff00) | value;
 +      timer_b2.count = timer_b2.reload;
@@ -433,7 +475,7 @@
  }
  
  void
-@@ -330,7 +577,7 @@
+@@ -330,7 +619,7 @@
  void
  mem_put_hi (int address, unsigned short value)
  {
@@ -442,7 +484,7 @@
      {
        printf ("SimTrace: %06lx %04x\n", regs.r_pc, value);
        return;
-@@ -414,12 +661,120 @@
+@@ -414,12 +703,120 @@
  }
  #endif
  
@@ -563,7 +605,7 @@
    switch (address)
      {
  #ifdef HAVE_TERMIOS_H
-@@ -618,3 +973,120 @@
+@@ -618,3 +1015,137 @@
      }
  }
  #endif
@@ -642,9 +684,26 @@
 +		 = 0x40 + vector number is established from the firmware's own
 +		 vector-table writes; 0x0045 is vector 5.)  HYPOTHESIS.  */
 +	      mem_put_qi (0x45, mem_get_qi (0x45) | 0x08);
-+	      /* Timer B2 is DMA request source 5: it paces the sample
-+		 stream between RAM and the D/A (playback) or A/D
-+		 (recording).  */
++	    }
++	}
++    }
++
++  /* Timer A3 is DMA request source 5: it paces the sample stream between
++     RAM and the D/A (playback) or A/D (recording), at whatever rate the
++     firmware has programmed.  */
++  if (timer_a3.on)
++    {
++      static const int div[4] = { 1, 8, 32, 32 };
++      int d = div[*mem_ptr (0x399) >> 6];
++
++      timer_a3.cycles += m32c_cpi;
++      while (timer_a3.cycles >= d)
++	{
++	  timer_a3.cycles -= d;
++	  if (--timer_a3.count < 0)
++	    {
++	      timer_a3.count = timer_a3.reload;
++	      *mem_ptr (0x58) |= 0x08;	/* TA3IC: request */
 +	      dma_service (5);
 +	    }
 +	}

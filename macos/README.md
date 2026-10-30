@@ -162,8 +162,9 @@ internalRenderBlock       copy out of the ring; that is all it does
 
 ### The output stage
 
-The chip's D/A runs at 10017 Hz (7.3728 MHz crystal / 8 / 92), which is not a
-rate anything else on a Mac wants. `OutputStage` bridges it with a windowed-sinc
+librc8650 delivers 10017 Hz (the chip's own D/A rate moves with the formant
+setting and is resampled to that by the library), which is not a rate anything
+else on a Mac wants. `OutputStage` bridges it with a windowed-sinc
 interpolator and then applies the reconstruction filter at the output rate;
 librc8650's own filter is switched off at boot and stays off.
 
