@@ -96,25 +96,38 @@ public final class RC8650SpeechAudioUnit: AVSpeechSynthesisProviderAudioUnit {
 
     // MARK: - Voices
 
-    private static let providedVoices: [AVSpeechSynthesisProviderVoice] =
-        RC8650Chip.voices.map { voice in
+    /// The chosen firmware's voices: eight on the RC8650, eleven on the
+    /// RC8660.  Booting first is what makes them that firmware's rather than
+    /// the built-in RC8650 stand-in; the container app asks the system to
+    /// re-read this list when the user switches image.
+    private static func providedVoices() -> [AVSpeechSynthesisProviderVoice] {
+        RC8650Engine.shared.start()
+        let profile = RC8650Chip.profile
+        return profile.voices.map { voice in
             let v = AVSpeechSynthesisProviderVoice(name: voice.systemName,
                                                    identifier: voice.identifier,
                                                    primaryLanguages: ["en-US"],
                                                    supportedLanguages: ["en-US"])
-            v.gender = .male
-            v.version = "2.60"      // the chip's firmware version, per 6?
+            // Gretchen is the RC8660's one female voice.
+            v.gender = voice.name == "Gretchen" ? .female : .male
+            v.version = profile.version     // the firmware's, from its header
             return v
         }
+    }
 
     public override var speechVoices: [AVSpeechSynthesisProviderVoice] {
-        get { Self.providedVoices }
+        get { Self.providedVoices() }
         set { }
     }
 
     // MARK: - Speaking
 
     public override func synthesizeSpeechRequest(_ speechRequest: AVSpeechSynthesisProviderRequest) {
+        // Before anything reads the chip's profile: the voice count and the
+        // per-chip settings key both come from the firmware that is running,
+        // and booting here is also what switches image if the app has chosen
+        // another since the last request.
+        RC8650Engine.shared.start()
         let voiceID = Self.voiceID(from: speechRequest.voice.identifier)
         let settings = SettingsStore.shared.current
         var parameters = settings.parameters(for: voiceID)

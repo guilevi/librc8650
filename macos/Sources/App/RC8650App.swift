@@ -23,7 +23,7 @@ struct RC8650App: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
-                Button("Install Firmware Image…") { model.chooseFirmware() }
+                Button("Add Firmware Image…") { model.chooseFirmware() }
                 Button("Refresh System Voice List") { model.refreshSystemVoices() }
             }
         }

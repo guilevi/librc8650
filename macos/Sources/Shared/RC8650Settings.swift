@@ -41,6 +41,12 @@ public struct RC8650Settings: Codable, Sendable {
     public var preamble: String = ""
     public var postamble: String = ""
 
+    /// The firmware image to run: a file name in `FirmwareCatalog.folder`, or an
+    /// absolute path.  Empty means the default — see `FirmwareCatalog.chosenURL`.
+    /// Here rather than in the app's own preferences because the extension has
+    /// to run the same image, and this is the file it reads.
+    public var firmware: String = ""
+
     public init() {}
 
     /// Field by field with defaults as fallbacks, for the same reason as
@@ -59,14 +65,24 @@ public struct RC8650Settings: Codable, Sendable {
         honorUtteranceVolume = get(.honorUtteranceVolume, d.honorUtteranceVolume)
         preamble = get(.preamble, d.preamble)
         postamble = get(.postamble, d.postamble)
+        firmware = get(.firmware, d.firmware)
+    }
+
+    /// Per voice AND per chip: a formant of 5 is the RC8650's default and the
+    /// bottom of the RC8660's 0-99, so one chip's tuning must not turn up on the
+    /// other.  The RC8650 keeps the bare voice number it always used, so
+    /// settings saved before there was a choice of firmware still load.
+    private static func key(_ voiceID: Int) -> String {
+        let chip = RC8650Chip.profile.chip
+        return chip == 8650 ? String(voiceID) : "\(chip)/\(voiceID)"
     }
 
     public func parameters(for voiceID: Int) -> Parameters {
-        voices[String(voiceID)] ?? Parameters.preset(for: voiceID)
+        voices[Self.key(voiceID)] ?? Parameters.preset(for: voiceID)
     }
 
     public mutating func setParameters(_ p: Parameters, for voiceID: Int) {
-        voices[String(voiceID)] = p
+        voices[Self.key(voiceID)] = p
     }
 }
 
@@ -103,8 +119,10 @@ public enum RC8650Storage {
         supportDirectory.appendingPathComponent("settings.json")
     }
 
-    /// Where the container app installs the firmware image for the extension to
-    /// find.  RC Systems' copyrighted code: not shipped, supplied by the user.
+    /// Where the container app used to install the one firmware image.  Still
+    /// found, and still what runs when nothing else has been chosen; new images
+    /// go in `FirmwareCatalog.folder`.  RC Systems' copyrighted code: not
+    /// shipped, supplied by the user.
     public static var firmwareURL: URL {
         supportDirectory.appendingPathComponent("firmware.srec")
     }

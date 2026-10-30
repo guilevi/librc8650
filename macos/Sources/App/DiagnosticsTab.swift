@@ -17,17 +17,32 @@ struct DiagnosticsTab: View {
 
                 Text("Firmware")
                     .font(.headline)
-                if let path = model.firmwarePath {
-                    LabeledContent("Image") {
-                        Text(path)
-                            .font(.system(.caption, design: .monospaced))
+                if !model.firmwareImages.isEmpty {
+                    // Every image in the firmware folder, each described by its
+                    // own header. Choosing one reboots the chip on it here, and
+                    // the system voices follow on their next utterance.
+                    Picker("Image", selection: $model.selectedFirmware) {
+                        ForEach(model.firmwareImages) { image in
+                            Text("\(image.label) — \(image.name)").tag(image.url.path)
+                        }
+                    }
+                    LabeledContent("Running") {
+                        Text("\(model.chip.chipName) firmware \(model.chip.version), model \(model.chip.model): \(model.chip.voices.count) voices, formant \(model.chip.formantRange.lowerBound)–\(model.chip.formantRange.upperBound), \(model.chip.rateLadder.count) rate steps")
                             .textSelection(.enabled)
+                    }
+                    if let path = model.firmwarePath {
+                        LabeledContent("File") {
+                            Text(path)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
                     }
                 } else {
                     Text("""
-                         No firmware image installed. The RC8650 firmware is RC Systems' \
-                         copyrighted code and is not distributed with this app: supply your \
-                         own Motorola S-record image.
+                         No firmware image installed. RC Systems' firmware is their \
+                         copyrighted code and is not distributed with this app: add your \
+                         own Motorola S-record image, for the RC8650 or the RC8660. \
+                         tools/rcstudio2srec.py in librc8650 makes them from RCStudio's files.
                          """)
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
@@ -39,7 +54,7 @@ struct DiagnosticsTab: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
-                    Button("Install Firmware Image…") { model.chooseFirmware() }
+                    Button("Add Firmware Image…") { model.chooseFirmware() }
                     Button("Cold-Boot the Chip") { model.resetChip() }
                 }
 

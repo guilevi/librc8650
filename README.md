@@ -61,6 +61,8 @@ stubs.c                stands in for the parts of the standalone simulator
                        disassembler, the newlib syscall layer
 defs.h  ansidecl.h     shims for two headers a GDB build tree would generate
 sim/                   the patch that turns stock gdb-14.2/sim/m32c into the core
+tools/                 rcstudio2srec.py (firmware images from RCStudio's files),
+                       phonlab.c
 win-compat/            what a Windows host lacks, for the mingw-w64 cross build
 nvda/                  the NVDA add-on, built on the two DLLs
 macos/                 the macOS system voice (speech synthesis extension + app)
@@ -454,9 +456,34 @@ do not:
 
 RC Systems' RCStudio ships six firmware sets, each a firmware container and a
 BIOS container in `RCStudio/Bin` (the format, the XOR obfuscation and the
-pairing are in the reverse-engineering notes, sections 2 and 3). The notes'
-`mksrec.py` turns any pair into a loadable S-record: `-m 1`, `2`, `4`, `7`, `8`
-or `8660`. All six boot, answer `6?` and `12?`, and speak.
+pairing are in the reverse-engineering notes, sections 2 and 3).
+`tools/rcstudio2srec.py --all <RCStudio>/Bin -o <folder>` turns every known
+pair into a loadable S-record named for what it is (`rc8650-v2.60-m4.srec`,
+`rc8660-v3.44-m1.srec`); a later release's pair is converted by naming its two
+files. The model-4 output is byte for byte the reference image. All six boot,
+answer `6?` and `12?`, and speak.
+
+The NVDA add-on and the Mac app both switch between images - see their
+READMEs - and take every chip-specific thing from the library rather than from
+a datasheet:
+
+```c
+rc8650_profile p;
+rc8650_get_profile(e, &p);   /* voices + presets, formant and speed ranges,
+                                rate ladder, 12? length, marker range */
+rc8650_image_info(srec, len, &p);   /* chip, version, model, without booting */
+```
+
+`rc8650_get_profile` asks the firmware: it selects every voice and reads it back
+with `12?`, binary-searches the speed and formant ranges the same way, and then
+reinitialises the chip (`@`) - 85-150 ms of host time, once per engine. Voice
+names and the rate ladder, which cannot be asked for, come from tables for the
+two known families; unknown firmware gets "Voice n" and its power-on speed scale.
+On the RC8660 only the V86 bit is touched while probing: its bit 4 is RTC, and
+with it clear commands wait for text before they show in `12?`. Its two speed
+scales are not interleaved into one ladder the way the RC8650's are, because
+clearing V86 on the RC8660 switches it into V8600 compatibility, where formant
+runs 0-9 and `12?` is 23 bytes.
 
 | `-m` | Containers | Firmware | `6?` | Factory defaults | Status |
 |---|---|---|---|---|---|

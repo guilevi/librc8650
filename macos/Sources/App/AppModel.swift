@@ -47,6 +47,12 @@ final class AppModel {
     var firmwarePath: String?
     var bootError: String?
 
+    /// Every firmware image found, and what the running one is.  The profile is
+    /// kept here as well as in RC8650Chip so that SwiftUI sees it change: a view
+    /// that lists voices or sizes a slider reads it, and redraws on a switch.
+    var firmwareImages: [FirmwareCatalog.Image] = []
+    var chip: ChipProfile = RC8650Chip.profile
+
     /// The dictionaries the extension speaks with.  Owned here rather than by
     /// the tab so that the editor windows — which are their own scenes — see
     /// the same list, and so that it survives the tab being switched away from.
@@ -68,6 +74,9 @@ final class AppModel {
         settings = loaded
         parameters = loaded.parameters(for: loaded.editingVoice)
         refreshChipState()
+        // Again, now the chip is up: settings are kept per chip, and which chip
+        // that is was not known until the chosen image had booted.
+        parameters = settings.parameters(for: settings.editingVoice)
     }
 
     private func persist() {
@@ -77,7 +86,7 @@ final class AppModel {
     // MARK: - Firmware and chip state
 
     func refreshChipState() {
-        firmwarePath = RC8650Engine.installedFirmwareURL()?.path
+        firmwareImages = FirmwareCatalog.images()
         if RC8650Engine.shared.start() {
             bootError = nil
             chipIdentification = RC8650Engine.shared.chipID()
@@ -85,6 +94,34 @@ final class AppModel {
             bootError = RC8650Engine.shared.bootFailure?.localizedDescription
             chipIdentification = nil
         }
+        firmwarePath = RC8650Engine.shared.firmwarePath
+            ?? RC8650Engine.installedFirmwareURL()?.path
+        chip = RC8650Chip.profile
+    }
+
+    /// The image the chip is running, for the firmware picker.
+    var selectedFirmware: String {
+        get { firmwarePath ?? "" }
+        set {
+            guard let image = firmwareImages.first(where: { $0.url.path == newValue }) else { return }
+            selectFirmware(image)
+        }
+    }
+
+    /// Run a different image.  The choice goes in settings.json, which is what
+    /// the extension reads, so the system voices follow on their next utterance;
+    /// the engine here reboots on it at once.
+    func selectFirmware(_ image: FirmwareCatalog.Image) {
+        stop()
+        let inFolder = image.url.deletingLastPathComponent().standardizedFileURL
+            == FirmwareCatalog.folder.standardizedFileURL
+        settings.firmware = inFolder ? image.name : image.url.path
+        refreshChipState()
+        // Settings are kept per chip, so the editor reloads for this one.
+        if settings.editingVoice >= chip.voices.count { settings.editingVoice = 0 }
+        parameters = settings.parameters(for: settings.editingVoice)
+        AVSpeechSynthesisProviderVoice.updateSpeechVoices()
+        status = bootError ?? "Running \(image.label): \(chip.voices.count) voices."
     }
 
     /// Ask for the user's own firmware image and put it where both this app and
@@ -92,8 +129,8 @@ final class AppModel {
     /// with any of this, and it is not this app's to distribute.
     func chooseFirmware() {
         let panel = NSOpenPanel()
-        panel.title = "Choose an RC8650 firmware image"
-        panel.message = "A Motorola S-record image of the RC8650 firmware (.srec, or .srec.gz)."
+        panel.title = "Add a firmware image"
+        panel.message = "A Motorola S-record image of RC8650 or RC8660 firmware (.srec, or .srec.gz). tools/rcstudio2srec.py in librc8650 makes them from RCStudio's files."
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.data]
@@ -101,20 +138,19 @@ final class AppModel {
         installFirmware(from: url)
     }
 
+    /// Copy an image into the firmware folder, where the extension can read it
+    /// too, and switch to it.
     func installFirmware(from url: URL) {
+        guard FirmwareCatalog.identify(url) != nil else {
+            status = "\(url.lastPathComponent) is not an RC8650 or RC8660 firmware image."
+            return
+        }
         do {
-            let image = try SRecordImage.load(from: url)
-            guard image.first == UInt8(ascii: "S") else {
-                status = "That does not look like an S-record image (it should start with 'S')."
-                return
+            let destination = try FirmwareCatalog.install(from: url)
+            firmwareImages = FirmwareCatalog.images()
+            if let image = FirmwareCatalog.identify(destination) {
+                selectFirmware(image)
             }
-            try RC8650Storage.ensureDirectory()
-            let destination = RC8650Storage.firmwareURL
-            try image.write(to: destination, options: .atomic)
-            RC8650Engine.shared.shutDown()
-            refreshChipState()
-            refreshSystemVoices()
-            status = bootError ?? "Firmware installed: \(destination.path)"
         } catch {
             status = "Could not install firmware: \(error.localizedDescription)"
         }

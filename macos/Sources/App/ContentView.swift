@@ -26,7 +26,7 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 16) {
             Picker("Voice", selection: $model.parameters.voice) {
-                ForEach(RC8650Chip.voices) { voice in
+                ForEach(model.chip.voices) { voice in
                     Text(voice.systemName).tag(voice.id)
                 }
             }
@@ -39,7 +39,8 @@ struct ContentView: View {
                     .foregroundStyle(.orange)
                     .help(model.bootError ?? "")
             } else {
-                Label("Chip ready", systemImage: "checkmark.seal")
+                Label("\(model.chip.chipName) \(model.chip.version) ready",
+                      systemImage: "checkmark.seal")
                     .foregroundStyle(.secondary)
             }
         }

@@ -25,13 +25,16 @@ public final class RC8650Engine: @unchecked Sendable {
     public enum Failure: Error, LocalizedError {
         case noFirmware(searched: [String])
         case libraryRefused(String)
+        case noAnswer(String)
 
         public var errorDescription: String? {
             switch self {
             case .noFirmware(let searched):
-                return "No RC8650 firmware image. Looked in:\n" + searched.joined(separator: "\n")
+                return "No firmware image. Looked in:\n" + searched.joined(separator: "\n")
             case .libraryRefused(let message):
                 return "librc8650 refused the firmware: \(message)"
+            case .noAnswer(let path):
+                return "The firmware in \(path) booted but did not answer."
             }
         }
     }
@@ -50,36 +53,22 @@ public final class RC8650Engine: @unchecked Sendable {
     public private(set) var bootFailure: Failure?
     public private(set) var firmwarePath: String?
 
+    /// The settings' firmware choice the running chip was booted for.  When
+    /// settings.json names a different one, the next `start` reboots on it —
+    /// which is how the extension follows a switch made in the app.
+    private var bootedChoice: String?
+
     private init() {}
 
     // MARK: - Firmware
 
-    /// Where a firmware image might be, most specific first.  The image is RC
-    /// Systems' copyrighted code and is not shipped with any of this; the
-    /// container app installs the user's own copy into Application Support,
-    /// which is the path both processes agree on.
+    /// Where a firmware image might be.  See `FirmwareCatalog`.
     public static func firmwareSearchPaths() -> [String] {
-        var paths: [String] = []
-        if let env = ProcessInfo.processInfo.environment["RC8650_FIRMWARE"] {
-            paths.append(env)
-        }
-        paths.append(RC8650Storage.supportDirectory.appendingPathComponent("firmware.srec").path)
-        paths.append(RC8650Storage.supportDirectory.appendingPathComponent("firmware.srec.gz").path)
-        for name in ["rc8650_m4_valid", "rc8650"] {
-            for ext in ["srec", "srec.gz"] {
-                if let url = Bundle.main.url(forResource: name, withExtension: ext) {
-                    paths.append(url.path)
-                }
-            }
-        }
-        return paths
+        [FirmwareCatalog.folder.path] + FirmwareCatalog.legacyURLs.map(\.path)
     }
 
     public static func installedFirmwareURL() -> URL? {
-        for path in firmwareSearchPaths() where FileManager.default.isReadableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        return nil
+        FirmwareCatalog.chosenURL()
     }
 
     // MARK: - Lifecycle
@@ -91,7 +80,13 @@ public final class RC8650Engine: @unchecked Sendable {
     public func start() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        if handle != nil { return true }
+        let choice = SettingsStore.shared.current.firmware
+        if handle != nil {
+            if choice == bootedChoice { return true }
+            // A different image has been chosen: one engine per process, so the
+            // running one goes before the new one can boot.
+            shutDown()
+        }
 
         let searched = Self.firmwareSearchPaths()
         guard let url = Self.installedFirmwareURL() else {
@@ -121,10 +116,23 @@ public final class RC8650Engine: @unchecked Sendable {
         // off: this app models the output stage itself, after the staircase,
         // where the analog one was. See OutputStage.
         rc8650_set_lowpass_hz(h, 0)
+
+        // What this firmware offers: voices, presets, ranges, rate ladder.
+        // Probed once here, and the chip is left at its power-on settings.
+        var profile = rc8650_profile()
+        guard rc8650_get_profile(h, &profile) == 0 else {
+            rc8650_free(h)
+            bootFailure = .noAnswer(url.path)
+            return false
+        }
+        RC8650Chip.profile = ChipProfile(profile)
+
         handle = h
         firmwarePath = url.path
+        bootedChoice = choice
         bootFailure = nil
         prime(h)
+        Self.log.info("booted \(url.lastPathComponent, privacy: .public): \(RC8650Chip.profile.chipName, privacy: .public) \(RC8650Chip.profile.version, privacy: .public), \(RC8650Chip.profile.voices.count) voices")
         return true
     }
 
@@ -166,6 +174,7 @@ public final class RC8650Engine: @unchecked Sendable {
         dictionary = nil
         dictionaryStamp = nil
         handle = nil
+        bootedChoice = nil
     }
 
     /// Cold-boot the chip again, discarding queued input and undrained audio.
@@ -400,7 +409,8 @@ public final class RC8650Engine: @unchecked Sendable {
         return ok == 0 ? buf : nil
     }
 
-    /// The 23-byte Interrogate reply (12?, datasheet Table 19) — the chip's own
+    /// The Interrogate reply (12?, datasheet Table 19) — 23 bytes, or 27 on the
+    /// RC8660 — the chip's own
     /// account of every setting it is holding.  Nothing here is inferred; this
     /// is how the presets and ranges in RC8650Chip were established, and the
     /// container app shows it live so a user can check the same way.
@@ -419,14 +429,17 @@ public final class RC8650Engine: @unchecked Sendable {
             let n = chunk.withUnsafeMutableBufferPointer { rc8650_read_serial(h, $0.baseAddress, $0.count) }
             if n > 0 {
                 reply.append(contentsOf: chunk[0..<n])
-                if reply.count >= 23 { break }
+                // All of it: stopping at 23 on an RC8660 would leave its last
+                // four bytes queued in front of the next reply.
+                if reply.count >= RC8650Chip.profile.interrogateLength { break }
             } else {
                 // Nothing waiting: let the CPU run a little by pulling audio.
                 let got = pcm.withUnsafeMutableBufferPointer { rc8650_read_s16(h, $0.baseAddress, $0.count, nil) }
                 if got == 0 { break }
             }
         }
-        return reply.count >= 23 ? Array(reply.prefix(23)) : nil
+        let length = RC8650Chip.profile.interrogateLength
+        return reply.count >= 23 ? Array(reply.prefix(length)) : nil
     }
 
     /// Send a raw command as <CTRL+A>cmd<CR> and return whatever the chip says

@@ -39,17 +39,44 @@ repository's Makefile.
 
 ### Firmware
 
-The RC8650 firmware image is RC Systems' copyrighted code and is **not**
-distributed here. Supply your own Motorola S-record image, through the app's
-**Install Firmware Image…** or by putting it at
+RC Systems' firmware is their copyrighted code and is **not** distributed here.
+Supply your own Motorola S-record images (`.srec`, or `.srec.gz`): any of the
+six RCStudio ships — five RC8650 v2.60 builds and the RC8660 v3.44 — or a later
+revision. `../tools/rcstudio2srec.py --all <RCStudio>/Bin -o <folder>` makes them
+from RCStudio's own files, named for what they are (`rc8660-v3.44-m1.srec`).
+
+**Add Firmware Image…** (Diagnostics tab, and the app menu) copies an image into
 
 ```
-~/Library/Group Containers/EC7L97XK6C.com.guilevi.rc8650/firmware.srec
+~/Library/Group Containers/EC7L97XK6C.com.guilevi.rc8650/Firmware/
 ```
 
-`build.sh` copies `rc8650_m4_valid.srec` there if it finds one beside the
-repository (`../../`). `.srec.gz` is accepted too — the app inflates it on
-install.
+and switches to it. The Diagnostics tab's **Image** picker lists every image in
+that folder, each described by its own header — chip, version, board model —
+and choosing one reboots the chip on it. The choice is stored in
+`settings.json`, which the speech extension reads before every utterance, so the
+system voices switch too; the app also asks macOS to re-read the voice list,
+which is how voices 8-10 (Goliath, Alvin, Gretchen) appear when the RC8660 is
+chosen. The old single `firmware.srec` beside `settings.json` is still found,
+and still what runs when nothing has been chosen.
+
+Nothing in the app is written for one chip. Voices, presets, the formant range,
+the speed range and the rate ladder all come from librc8650's profile of the
+running firmware (`rc8650_get_profile`, see `Sources/Shared/ChipProfile.swift`),
+most of it read back out of the firmware with its Interrogate command at boot.
+Per-voice settings are kept per chip — the RC8650's under the voice number they
+always used, the RC8660's under `8660/<voice>` — because a formant of 5 is the
+RC8650's default and the bottom of the RC8660's 0-99.
+
+| | RC8650 v2.60 | RC8660 v3.44 |
+|---|---|---|
+| Voices | 8 | 11 |
+| Formant | 0–9, default 5 | 0–99, default 50 |
+| Rate | 20 rungs, both speed scales interleaved | 14 rungs, its own scale |
+| `12?` reply | 23 bytes | 27 (adds free recording memory and file count) |
+
+`build.sh` copies `rc8650_m4_valid.srec` beside `settings.json` if it finds one
+beside the repository (`../../`).
 
 ### Signing, sandboxing and the App Group
 

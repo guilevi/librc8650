@@ -25,10 +25,21 @@ public enum RC8650Chip {
 
     public struct Voice: Identifiable, Hashable, Sendable {
         public let id: Int          // the nO argument
-        public let name: String     // datasheet Table 7
+        public let name: String     // datasheet Table 7, or the RC8660's
+        public let chipName: String // "RC8650", "RC8660"
         public let preset: Preset
+
+        public init(id: Int, name: String, chipName: String = "RC8650", preset: Preset) {
+            self.id = id
+            self.name = name
+            self.chipName = chipName
+            self.preset = preset
+        }
+
         /// What the voice is called to the rest of macOS.
-        public var systemName: String { "RC8650 \(name)" }
+        public var systemName: String { "\(chipName) \(name)" }
+        /// Not chip-specific, on purpose: a voice the user picked in System
+        /// Settings stays picked when the firmware is switched underneath it.
         public var identifier: String { "com.guilevi.rc8650.voice.\(id)" }
     }
 
@@ -45,26 +56,14 @@ public enum RC8650Chip {
         public let wordDelay: Int    // 0...15
     }
 
-    public static let voices: [Voice] = [
-        Voice(id: 0, name: "Perfect Paul",
-              preset: Preset(pitch: 50, articulation: 5, formant: 5, tone: 1, expression: 5, reverb: 0, wordDelay: 0)),
-        Voice(id: 1, name: "Vader",
-              preset: Preset(pitch: 10, articulation: 4, formant: 0, tone: 1, expression: 6, reverb: 3, wordDelay: 0)),
-        Voice(id: 2, name: "Big Bob",
-              preset: Preset(pitch: 40, articulation: 5, formant: 3, tone: 0, expression: 5, reverb: 0, wordDelay: 0)),
-        Voice(id: 3, name: "Precise Pete",
-              preset: Preset(pitch: 60, articulation: 6, formant: 6, tone: 2, expression: 4, reverb: 0, wordDelay: 0)),
-        Voice(id: 4, name: "Ricochet Randy",
-              preset: Preset(pitch: 40, articulation: 5, formant: 5, tone: 1, expression: 5, reverb: 9, wordDelay: 0)),
-        Voice(id: 5, name: "Biff",
-              preset: Preset(pitch: 50, articulation: 6, formant: 0, tone: 0, expression: 7, reverb: 0, wordDelay: 0)),
-        Voice(id: 6, name: "Skip",
-              preset: Preset(pitch: 15, articulation: 6, formant: 9, tone: 0, expression: 7, reverb: 0, wordDelay: 0)),
-        Voice(id: 7, name: "Robo Robert",
-              preset: Preset(pitch: 80, articulation: 5, formant: 7, tone: 1, expression: 0, reverb: 6, wordDelay: 1)),
-    ]
+    /// The voices of the firmware the engine is running: eight on the RC8650,
+    /// eleven on the RC8660.  See `ChipProfile`.
+    public static var voices: [Voice] { profile.voices }
 
-    public static func voice(id: Int) -> Voice { voices[max(0, min(voices.count - 1, id))] }
+    public static func voice(id: Int) -> Voice {
+        let all = voices
+        return all[max(0, min(all.count - 1, id))]
+    }
 
     // MARK: - The rate ladder
 
@@ -87,12 +86,12 @@ public enum RC8650Chip {
     /// two pairs are swapped from the order this table used to have — the old
     /// measurements were taken through the truncation bug, which occasionally
     /// timed a fragment rather than an utterance.
-    public static let rateLadder: [(por: Int, speed: Int)] = [
-        (0, 0), (0, 1), (0, 2), (0, 3), (0, 4),
-        (0, 5), (128, 0), (0, 6), (0, 7), (128, 1),
-        (128, 2), (128, 3), (0, 8), (128, 4), (0, 9),
-        (128, 5), (128, 6), (128, 7), (128, 8), (128, 9),
-    ]
+    ///
+    /// That is the RC8650's ladder.  The firmware's own comes from
+    /// `ChipProfile`: the RC8660's is its own scale alone, 0S-13S, because
+    /// clearing V86 there switches it into V8600 compatibility, which also
+    /// narrows the formant setting to 0-9.
+    public static var rateLadder: [(por: Int, speed: Int)] { profile.rateLadder }
 
     /// Length of one fixed sentence at each rung, in samples at 10017 Hz.
     /// Measured, three consecutive utterances per rung, all three identical.
@@ -100,27 +99,33 @@ public enum RC8650Chip {
     /// asking for "150% of normal" is asking for a rung whose duration is two
     /// thirds of the current one, which is a ratio these numbers can answer and
     /// a words-per-minute label cannot.
-    public static let rateDuration: [Int] = [
-        26572, 24686, 22036, 20890, 18529,
-        17131, 16773, 16422, 15504, 15375,
-        14695, 13777, 13582, 13198, 12617,
-        12233, 9443, 9199, 8493, 7653,
-    ]
+    public static var rateDuration: [Int] { profile.rateDuration }
 
     /// Words per minute, derived from those durations against the chip's
     /// power-on rate of about 199 wpm. Labelling only.
-    public static let rateWPM: [Int] = rateDuration.map {
-        Int((199.0 * Double(rateDuration[defaultRateRung]) / Double($0)).rounded())
+    /// Approximate for any chip but the RC8650 the 199 wpm was measured on.
+    public static var rateWPM: [Int] {
+        let durations = rateDuration
+        let base = durations.indices.contains(defaultRateRung) ? durations[defaultRateRung] : 0
+        return durations.map { $0 > 0 && base > 0
+            ? Int((199.0 * Double(base) / Double($0)).rounded()) : 0 }
     }
 
-    /// The rung holding the chip's own power-on rate, (128, 1).
-    public static let defaultRateRung = 9
+    /// The rung holding the chip's own power-on rate: (128, 1) on most RC8650
+    /// models, (0, 5) on models 2 and 8, 5S on the RC8660.
+    public static var defaultRateRung: Int { profile.defaultRateRung }
 
     /// The rung closest to `scale` times the speed of `rung` — the mapping an
     /// SSML `<prosody rate="150%">` needs. Speed is the reciprocal of duration.
     public static func rateRung(scaling rung: Int, by scale: Double) -> Int {
         guard scale > 0, scale != 1 else { return rung }
+        let rateDuration = self.rateDuration
         let base = rung.clamped(to: 0...(rateDuration.count - 1))
+        // A ladder without measured lengths: scale the position instead.
+        guard rateDuration[base] > 0 else {
+            return (Int((Double(base + 1) * scale).rounded()) - 1)
+                .clamped(to: 0...(rateDuration.count - 1))
+        }
         let want = Double(rateDuration[base]) / scale
         var best = base
         var bestError = Double.greatestFiniteMagnitude
@@ -182,11 +187,11 @@ public enum RC8650Chip {
     // MARK: - Ranges
 
     public static let pitchRange        = 0...99   // nP, mod 100
-    public static let speedRange        = 0...9    // nS, mod 10
+    public static var speedRange: ClosedRange<Int> { profile.speedRange }    // nS: 0-9, RC8660 0-13
     public static let volumeRange       = 0...9    // nV
     public static let expressionRange   = 0...9    // nE
     public static let articulationRange = 0...9    // nA
-    public static let formantRange      = 0...9    // nF
+    public static var formantRange: ClosedRange<Int> { profile.formantRange }  // nF: 0-9, RC8660 0-99
     public static let reverbRange       = 0...9    // nR
     public static let toneRange         = 0...2    // nX
     public static let delayRange        = 0...15   // nT / nC, 16 is rejected
@@ -371,13 +376,22 @@ public enum RC8650Chip {
 
     /// The 23 fields of the Interrogate reply, in order, decoded 23-for-23
     /// against datasheet Table 19.
-    public static let interrogateFields: [String] = [
+    public static let interrogateFields23: [String] = [
         "Mode", "Punctuation filter (PFR)", "Formant", "Pitch", "Speed",
         "Volume", "Tone", "Expression", "Dictionary loaded", "Dictionary status",
         "Input buffer", "Articulation", "Reverb", "TS pin", "Protocol options (POR)",
         "Audio control (ACR)", "Recording memory", "Sleep", "Timeout",
         "Character delay", "Text delay", "Voice", "ADR",
     ]
+
+    /// The RC8660 adds four (its Table 21): free recording memory and the
+    /// number of files, each 16 bits.
+    public static var interrogateFields: [String] {
+        profile.interrogateLength >= 27
+            ? interrogateFields23 + ["Free recording memory (high)", "Free recording memory (low)",
+                                     "Files (high)", "Files (low)"]
+            : interrogateFields23
+    }
 }
 
 /// One complete set of chip parameters — everything the firmware will let a
