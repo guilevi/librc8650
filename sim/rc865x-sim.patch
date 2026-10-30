@@ -2481,6 +2481,21 @@
        break;
      case 15:
        addr = disp16 ();
+@@ -706,7 +797,13 @@
+     }
+   else
+     {
+-      addr &= addr_mask;
++      /* addr is a *bit* address here, three bits wider than a byte address.
++	 Masking it with the byte-address mask wrapped every bit operand at
++	 or above byte 0x2000: the RC8660's variables sit at SB = 0x2A14, so
++	 its "playback running" flag (and every other SB-relative bit) landed
++	 on the wrong byte, the synthesizer never throttled, and speech
++	 stopped about one and a half laps of the sample ring in.  */
++      addr &= (addr_mask << 3) | 7;
+       sd.mem = 1;
+       sd.mask = 1 << (addr & 7);
+       sd.u.addr = addr >> 3;
 --- a/sim/m32c/syscalls.c
 +++ b/sim/m32c/syscalls.c
 @@ -179,6 +179,15 @@
