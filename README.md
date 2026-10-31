@@ -201,17 +201,26 @@ How the samples are resampled is a choice too, because real products differ:
 |---|---|---|
 | Smooth (default) | nothing | the 10 kHz stream, which whatever plays it interpolates; nothing above 5 kHz |
 | D/A staircase | `rc8650_set_output_rate(e, 48000)` | each sample held for a whole D/A period, so the mirror images of the speech either side of 10, 20, 30 kHz are there, under the low-pass |
-| BookPort | the above, plus `rc8650_set_dac_rate(e, 10486)`, `rc8650_set_lowpass_order(e, 1)`, `rc8650_set_lowpass_hz(e, 3600)` | one measured unit (below) |
+| BookPort | the above, plus `rc8650_set_dac_rate(e, 10488)`, `rc8650_set_lowpass_order(e, 1)`, `rc8650_set_lowpass_hz(e, 5000)` | one measured unit (below) |
 
-The BookPort figures come from a recording of an APH BookPort starting up.
-Its spectrum has the D/A's images in plain view between 6 and 10 kHz, and
-images plus a null at the D/A rate put that rate at about 10,486 Hz rather
-than 10,017: its chip runs about 4.7% fast, so it speaks that much higher and
-quicker. Its output filter fits a first-order low-pass at about 3.6 kHz to a
-median error of 0.7 dB, where the datasheet's second-order 3 kHz filter is off
-by 11.8 dB. Rendered with those settings, the emulator's band levels from 3 to
-20 kHz match the recording's within about 1 to 5 dB; the plain staircase under
-no filter is up to 16 dB too bright.
+The BookPort figures come from a recording of an APH BookPort saying
+"BookPort 2.4.0.0 ready", compared with the emulator saying the same:
+
+- **Images, but not a fast chip.** The recording's D/A images mirror about
+  10,488 Hz (the same measurement gives 10,017 on the emulator's own
+  staircase). Yet its fundamental (85 Hz median) and its formants (within
+  1%) are the stock firmware's at the stock rate - a chip simply clocked
+  4.7% fast would raise both by 4.7%, and on all six firmware images the
+  formant setting moves pitch, formants and the D/A rate together. So
+  `rc8650_set_dac_rate` moves only the images: the chip's stream is
+  resampled to the D/A rate before it is held.
+- **Chip settings.** It speaks with treble tone (`2X`: the spectral match
+  goes from 0.992 to 0.997 correlation) and about 12% faster than the
+  default, between `2S` and `3S` on the V86 scale. Those are ordinary voice
+  settings, so the BookPort output mode does not impose them.
+- **Output filter.** With treble, a first-order low-pass at 5 kHz brings
+  every band from 300 Hz to 20 kHz within about 1 dB of the recording,
+  except 4.5-6 kHz beside the D/A's Nyquist frequency, within 4 dB.
 
 `rc8650_samples_read` and index-marker positions stay in D/A samples whatever
 the output rate, so marker sync needs no change. The NVDA add-on offers these

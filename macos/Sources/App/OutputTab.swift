@@ -36,10 +36,11 @@ struct OutputTab: View {
                      Smooth interpolates between the chip's samples and keeps nothing \
                      above 5 kHz. The D/A staircase holds each sample the way the D/A \
                      pin does, keeping the mirror images that puts above 5 kHz for the \
-                     filter below to soften. BookPort is one measured unit: its D/A runs \
-                     about 5% fast, so it speaks a little higher and quicker, and its \
-                     gentle filter leaves much of the images in. BookPort replaces the \
-                     filter settings below.
+                     filter below to soften. BookPort is one measured unit: its images \
+                     sit a little higher than the standard chip's and its gentle filter \
+                     leaves much of them in, while the voice keeps its usual pitch. \
+                     BookPort replaces the filter settings below. To sound like that \
+                     unit, also choose treble tone and a slightly faster rate.
                      """)
                     .font(.caption)
                     .foregroundStyle(.secondary)

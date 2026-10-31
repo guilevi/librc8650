@@ -134,6 +134,14 @@ public struct OutputStage {
     private var holdFill: Double = 0
     private var holdSum: Double = 0
     private var gentle: OnePole?
+    /// For a D/A clocked away from the chip's rate: chip samples per D/A
+    /// sample, the chip's last eight samples, and where the next D/A sample
+    /// falls after the fourth of them.  The stream is resampled to the D/A
+    /// rate (Lanczos, a = 4) before it is held, so the images move and the
+    /// voice does not — what the BookPort recording shows.
+    private let resampleStep: Double?
+    private var resampleHistory = [Double](repeating: 0, count: 8)
+    private var resamplePhase: Double = 0
     /// Where the next output sample falls, in input samples into `history`.
     private var position: Double
     /// Input history, with `taps` samples of run-up in front of `position`.
@@ -146,11 +154,12 @@ public struct OutputStage {
                 outputRate: Double,
                 cornerHz: Int?,
                 resampling: RC8650Chip.Resampling = .smooth) {
-        let inputRate = resampling == .bookport ? RC8650Chip.bookportDACRate : inputRate
         self.inputRate = inputRate
         self.outputRate = outputRate
         step = inputRate / outputRate
-        hold = resampling == .smooth ? nil : outputRate / inputRate
+        let dacRate = resampling == .bookport ? RC8650Chip.bookportDACRate : inputRate
+        hold = resampling == .smooth ? nil : outputRate / dacRate
+        resampleStep = dacRate == inputRate ? nil : inputRate / dacRate
         history = [Float](repeating: 0, count: Self.taps)
         position = Double(Self.taps)
         if resampling == .bookport {
@@ -171,23 +180,48 @@ public struct OutputStage {
         }
     }
 
+    /// Hold one D/A level for `period` output samples, each output sample
+    /// the level averaged over its own span.
+    private mutating func holdLevel(_ level: Double, for period: Double, _ emit: (Float) -> Void) {
+        var left = period
+        while left > 1e-9 {
+            let take = min(1 - holdFill, left)
+            holdSum += level * take
+            holdFill += take
+            left -= take
+            if holdFill >= 1 - 1e-9 {
+                output(Float(holdSum), emit)
+                holdSum = 0
+                holdFill = 0
+            }
+        }
+    }
+
     public mutating func process(_ input: UnsafeBufferPointer<Int16>, emit: (Float) -> Void) {
         guard !input.isEmpty else { return }
         if let hold {
             for sample in input {
                 let level = Double(sample) / 32768
-                var left = hold
-                while left > 1e-9 {
-                    let take = min(1 - holdFill, left)
-                    holdSum += level * take
-                    holdFill += take
-                    left -= take
-                    if holdFill >= 1 - 1e-9 {
-                        output(Float(holdSum), emit)
-                        holdSum = 0
-                        holdFill = 0
-                    }
+                guard let resampleStep else {
+                    holdLevel(level, for: hold, emit)
+                    continue
                 }
+                resampleHistory.removeFirst()
+                resampleHistory.append(level)
+                while resamplePhase < 1 {
+                    var sum = 0.0, weights = 0.0
+                    for j in -3...4 {
+                        let x = resamplePhase - Double(j)
+                        let w = abs(x) < 1e-9
+                            ? 1
+                            : 4 * sin(.pi * x) * sin(.pi * x / 4) / (.pi * .pi * x * x)
+                        sum += w * resampleHistory[3 + j]
+                        weights += w
+                    }
+                    holdLevel(sum / weights, for: hold, emit)
+                    resamplePhase += resampleStep
+                }
+                resamplePhase -= 1
             }
             return
         }

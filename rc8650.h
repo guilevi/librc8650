@@ -174,7 +174,7 @@ unsigned rc8650_get_lowpass_hz (rc8650_t *e);
 
 /* The low-pass's order: 2 (the default, a Butterworth biquad) or 1 (a gentle
  * one-pole).  Real products differ: an APH BookPort measured as the D/A's
- * staircase under roughly a first-order 3.6 kHz filter, images and all. */
+ * staircase under a first-order 5 kHz filter, images and all. */
 void rc8650_set_lowpass_order (rc8650_t *e, unsigned order);
 
 /* Run the s16 path at hz instead of the D/A's own rate.  0, the default, keeps
@@ -193,11 +193,14 @@ void rc8650_set_lowpass_order (rc8650_t *e, unsigned order);
 void rc8650_set_output_rate (rc8650_t *e, unsigned hz);
 unsigned rc8650_get_output_rate (rc8650_t *e);
 
-/* The D/A rate the staircase is held at, for rc8650_set_output_rate's path:
- * RC8650_SAMPLE_RATE unless the product ran its chip from a different clock.
- * The BookPort recording's images sit around 10,486 Hz, not 10,017: its chip
- * runs about 4.7% fast, which raises pitch and formants and shortens speech by
- * the same proportion.  4000..20000; 0 restores the default. */
+/* The D/A rate the staircase is held at, for rc8650_set_output_rate's path.
+ * It moves the images and nothing else: at any rate but RC8650_SAMPLE_RATE
+ * the chip's stream is resampled to it first (Lanczos, a = 4), so pitch,
+ * formants and timing stay as the chip made them.  That is what a BookPort
+ * recording shows: images mirrored about 10,488 Hz, with the fundamental and
+ * formants of the stock firmware at its own rate - so whatever drives that
+ * unit's D/A, it is not simply a faster clock.  4000..20000; 0 restores the
+ * default.  Below the chip's rate the resampling can alias a little. */
 void rc8650_set_dac_rate (rc8650_t *e, unsigned hz);
 
 /* Bytes the chip has sent back on its serial port: replies to query commands

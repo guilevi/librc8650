@@ -471,18 +471,22 @@ class SynthDriver(SynthDriver):
 	# that at 48 kHz, then applies the output filter chosen above.
 	#
 	# "bookport" is one particular unit, measured from a recording of a
-	# BookPort starting up: its D/A runs at about 10,486 Hz rather than the
-	# nominal 10,017 - so it speaks about 5% higher and faster - and its
-	# output filter is a gentle first-order one at about 3.6 kHz, which
-	# leaves much of the images in. That is the "hissy", slightly brighter
-	# BookPort sound. It overrides the output filter setting.
+	# BookPort saying "BookPort 2.4.0.0 ready": its D/A images mirror about
+	# 10,488 Hz rather than 10,017, while its pitch and formants are the
+	# stock firmware's - so the library resamples the speech to that rate
+	# before holding it, which moves the images and leaves the voice alone.
+	# Its output filter is a gentle first-order one at 5 kHz, which leaves
+	# much of the images in: the "hissy", brighter BookPort sound. It
+	# overrides the output filter setting. That unit also speaks with treble
+	# tone and about 12% faster than the default, which are the ordinary
+	# Tone and Rate settings, not this one.
 	OUTPUT_RATE = 48000
 	_resamplings = {
 		"smooth": StringParameterInfo("smooth", "Smooth (10 kHz, no D/A images)"),
 		"staircase": StringParameterInfo("staircase",
 			"D/A staircase (48 kHz, images kept)"),
 		"bookport": StringParameterInfo("bookport",
-			"BookPort (staircase, 10.49 kHz D/A, gentle 3.6 kHz filter)"),
+			"BookPort (staircase, images at 10.49 kHz, gentle 5 kHz filter)"),
 	}
 
 	@classmethod
@@ -619,7 +623,7 @@ class SynthDriver(SynthDriver):
 		if not self._rc.hasStaircase or self._resampling == "smooth":
 			return 0, 0, int(self._filter), 2
 		if self._resampling == "bookport":
-			return self.OUTPUT_RATE, 10486, 3600, 1
+			return self.OUTPUT_RATE, 10488, 5000, 1
 		return self.OUTPUT_RATE, 0, int(self._filter), 2
 
 	def _applyOutputStage(self):

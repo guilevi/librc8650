@@ -144,15 +144,15 @@ def one(driverDir, dylib, image):
 	check("%s: all %d voices sound different" % (name, len(voices)),
 		not same, "identical audio: %r" % same)
 
-	# Each resampling: the player follows the output rate, and every D/A
-	# sample becomes output_rate / D/A rate output samples - the nominal
-	# rate for the staircase, a BookPort's faster one for that. Measured
-	# against the chip's own sample count, since the same sentence twice
-	# need not come out the same length.
+	# Each resampling: the player follows the output rate, and every chip
+	# sample becomes output_rate / 10017 output samples whatever the D/A
+	# rate - a BookPort's faster D/A moves the images, not the timing.
+	# Measured against the chip's own sample count, since the same sentence
+	# twice need not come out the same length.
 	ratios = {}
 	driver._player.fed.clear()
 	lib, h = driver._rc.lib, driver._rc.handle
-	for mode, rate, dac in (("staircase", 48000, 10017), ("bookport", 48000, 10486),
+	for mode, rate, dac in (("staircase", 48000, 10017), ("bookport", 48000, 10017),
 			("smooth", 10017, 10017)):
 		driver._set_resampling(mode)
 		before = len(done.notified)

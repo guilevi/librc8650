@@ -10,6 +10,9 @@
  */
 
 #include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,6 +236,12 @@ struct rc8650
   double sc_fill;		/* staircase: how much of it is filled, 0..1 */
   double sc_level;		/* staircase: the D/A sample being held */
   double sc_left;		/* staircase: how much of its period is left */
+  double rs_hist[8];		/* staircase: the chip's last 8 samples, for
+				   resampling them to a different D/A rate */
+  double rs_phase;		/* where the next held sample falls after
+				   rs_hist[3], in chip samples */
+  double lq[64];		/* staircase: levels waiting to be held */
+  unsigned lq_head, lq_n;
   double b0, b1, b2, a1, a2;	/* biquad coefficients */
   double x1, x2, y1, y2;	/* biquad state */
 };
@@ -254,6 +263,9 @@ biquad_reset (rc8650_t *e)
 {
   e->x1 = e->x2 = e->y1 = e->y2 = 0.0;
   e->sc_acc = e->sc_fill = e->sc_level = e->sc_left = 0.0;
+  memset (e->rs_hist, 0, sizeof e->rs_hist);
+  e->rs_phase = 0.0;
+  e->lq_head = e->lq_n = 0;
 }
 
 /* The low-pass at whichever rate the s16 path runs: a second-order
@@ -1789,15 +1801,66 @@ rc8650_read (rc8650_t *e, uint8_t *pcm, size_t max_samples, int *done)
   return n;
 }
 
-/* Spend what is left of the D/A sample being held on output samples, each
-   one the level averaged over its own span, until the sample runs out or the
-   buffer is full.  Returns the new fill of pcm. */
+/* One chip sample in, the levels the D/A holds out: the sample itself
+   when the D/A runs at the chip's rate, otherwise the chip's stream
+   resampled to the D/A's (Lanczos, a = 4), so a D/A clocked differently
+   moves the images and nothing else - pitch, formants and timing stay
+   where the chip put them.  Latency is four chip samples. */
+static void
+stair_push (rc8650_t *e, double level)
+{
+  double step;
+  int j;
+
+  if (e->dac_rate == RC8650_SAMPLE_RATE)
+    {
+      if (e->lq_n < 64)
+	e->lq[(e->lq_head + e->lq_n++) % 64] = level;
+      return;
+    }
+  memmove (e->rs_hist, e->rs_hist + 1, 7 * sizeof e->rs_hist[0]);
+  e->rs_hist[7] = level;
+  step = (double) RC8650_SAMPLE_RATE / e->dac_rate;
+  while (e->rs_phase < 1.0)
+    {
+      double sum = 0.0, wsum = 0.0;
+      for (j = -3; j <= 4; j++)
+	{
+	  double x = e->rs_phase - j, w;
+	  if (fabs (x) < 1e-9)
+	    w = 1.0;
+	  else
+	    w = 4.0 * sin (M_PI * x) * sin (M_PI * x / 4.0) / (M_PI * M_PI * x * x);
+	  sum += w * e->rs_hist[3 + j];
+	  wsum += w;
+	}
+      if (e->lq_n < 64)
+	e->lq[(e->lq_head + e->lq_n++) % 64] = sum / wsum;
+      e->rs_phase += step;
+    }
+  e->rs_phase -= 1.0;
+}
+
+/* Spend the held levels on output samples, each one the level averaged over
+   its own span, until they run out or the buffer is full.  Returns the new
+   fill of pcm. */
 static size_t
 stair_hold (rc8650_t *e, int16_t *pcm, size_t total, size_t max)
 {
-  while (e->sc_left > 0.0 && total < max)
+  double per = (double) e->out_rate / e->dac_rate, take;
+
+  while (total < max)
     {
-      double take = 1.0 - e->sc_fill;
+      if (e->sc_left <= 0.0)
+	{
+	  if (!e->lq_n)
+	    break;
+	  e->sc_level = e->lq[e->lq_head];
+	  e->lq_head = (e->lq_head + 1) % 64;
+	  e->lq_n--;
+	  e->sc_left = per;
+	}
+      take = 1.0 - e->sc_fill;
       if (take > e->sc_left)
 	take = e->sc_left;
       e->sc_acc += e->sc_level * take;
@@ -1824,42 +1887,40 @@ rc8650_read_s16 (rc8650_t *e, int16_t *pcm, size_t max_samples, int *done)
 
   if (e && e->out_rate)
     {
-      /* The D/A as it really is: a staircase, each sample held for one D/A
+      /* The D/A as it really is: a staircase, each level held for one D/A
 	 period (out_rate / dac_rate output samples, rarely a whole number),
 	 and every output sample the level averaged over its own span - so the
 	 images either side of each multiple of the D/A rate come out at the
 	 strength the sample-and-hold gives them, under the low-pass, instead
 	 of being removed by whatever resamples the 10 kHz stream later.
 
-	 Only as many D/A samples are pulled as are sure to fit, so none is
-	 read and then lost; the one sample a buffer shorter than a D/A period
-	 cannot take whole is held over in sc_level/sc_left.  The short-read
-	 rule below still holds. */
+	 Only as many chip samples are pulled as are sure to fit; the levels
+	 the last of them makes that the buffer cannot take wait in lq, and a
+	 level a buffer shorter than a D/A period cannot take whole is held
+	 over in sc_level/sc_left.  The short-read rule below still holds. */
       double per = (double) e->out_rate / e->dac_rate;
+      double per_in = (double) e->out_rate / RC8650_SAMPLE_RATE;
 
       while (total < max_samples)
 	{
 	  size_t want, n, i;
 
-	  /* Finish the sample being held first: a buffer smaller than one D/A
-	     period leaves the rest of it here for the next call. */
+	  /* Finish what is held over first. */
 	  total = stair_hold (e, pcm, total, max_samples);
 	  if (total >= max_samples)
 	    break;
 
-	  /* As many D/A samples as are sure to fit, at least one. */
-	  want = (size_t) ((max_samples - total + 1 - e->sc_fill) / per);
-	  if (want > 1)
-	    want--;
-	  if (want == 0)
-	    want = 1;
+	  /* As many chip samples as are sure to fit, at least one. */
+	  {
+	    double room = (double) (max_samples - total) - per - 2.0;
+	    want = room > per_in ? (size_t) (room / per_in) : 1;
+	  }
 	  if (want > sizeof tmp)
 	    want = sizeof tmp;
 	  n = rc8650_read (e, tmp, want, &d);
 	  for (i = 0; i < n; i++)
 	    {
-	      e->sc_level = (tmp[i] - 128) * 256.0 * OUT_GAIN;
-	      e->sc_left = per;
+	      stair_push (e, (tmp[i] - 128) * 256.0 * OUT_GAIN);
 	      total = stair_hold (e, pcm, total, max_samples);
 	    }
 	  if (n < want)

@@ -261,28 +261,29 @@ public enum RC8650Chip {
         /// images either side of every multiple of the D/A rate kept, then
         /// the reconstruction filter.
         case staircase
-        /// One real unit, measured from a recording of a BookPort starting
-        /// up: the staircase at a D/A rate of about 10,486 Hz, under a gentle
-        /// first-order 3.6 kHz filter that leaves much of the images in.
-        /// Replaces the reconstruction filter setting.
+        /// One real unit, measured from a recording of a BookPort: the
+        /// staircase with its images about 10,488 Hz, under a gentle
+        /// first-order 5 kHz filter that leaves much of them in.  Replaces
+        /// the reconstruction filter setting.
         case bookport
 
         public var name: String {
             switch self {
             case .smooth: return "Smooth — 10 kHz, no D/A images"
             case .staircase: return "D/A staircase — images kept"
-            case .bookport: return "BookPort — 10.49 kHz D/A, gentle 3.6 kHz filter"
+            case .bookport: return "BookPort — images at 10.49 kHz, gentle 5 kHz filter"
             }
         }
     }
 
-    /// The BookPort's output stage, fitted to its recording: D/A images
-    /// and a null at the D/A rate put that at 10,486 Hz, about 4.7% above
-    /// the nominal rate, so it speaks that much higher and faster; and a
-    /// first-order low-pass at 3.6 kHz fits its spectrum to a median 0.7 dB
-    /// where the datasheet's second-order 3 kHz one is off by 11.8 dB.
-    public static let bookportDACRate = 10486.0
-    public static let bookportCornerHz = 3600
+    /// The BookPort's output stage, fitted to a recording of it saying
+    /// "BookPort 2.4.0.0 ready": its D/A images mirror about 10,488 Hz, yet
+    /// its pitch and formants are the stock firmware's at the stock rate, so
+    /// only the images move (OutputStage resamples before holding).  With
+    /// the treble tone that unit also uses, a first-order 5 kHz low-pass
+    /// brings every band to within about 1 dB of the recording.
+    public static let bookportDACRate = 10488.0
+    public static let bookportCornerHz = 5000
 
     // MARK: - Building the command stream
 

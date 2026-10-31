@@ -44,12 +44,23 @@ usage (FILE *f)
 	   "  -d FILE      load a pronunciation dictionary (repeatable)\n"
 	   "  --phonemes   allow [[K AE T]] phoneme escapes in the text\n"
 	   "  --chip-id    print the 6? chipset identification and exit\n"
+	   "  --rate HZ    16-bit output at HZ, the D/A's sample-and-hold\n"
+	   "               staircase kept (images and all) rather than\n"
+	   "               smoothed away\n"
+	   "  --dac-rate HZ  D/A rate the staircase is held at (default %d);\n"
+	   "               moves the images, not the voice\n"
+	   "  --lowpass HZ   output filter corner, 0 for none\n"
+	   "  --order N      output filter order, 1 or 2 (default 2)\n"
+	   "  --bookport   the output stage measured from a BookPort: --rate 48000\n"
+	   "               --dac-rate 10488 --lowpass 5000 --order 1.  That unit\n"
+	   "               also speaks with -c 2X (treble) and about -c 3S\n"
 	   "  -q           quiet: no progress on stderr\n"
 	   "  -h, --help   this message\n"
 	   "\n"
 	   "With no text arguments the text is read from stdin.\n"
-	   "Audio is unsigned 8-bit mono at %d Hz.\n", DEFAULT_FIRMWARE,
-	   RC8650_SAMPLE_RATE);
+	   "Audio is unsigned 8-bit mono at %d Hz, or 16-bit once any of\n"
+	   "--rate, --lowpass, --order or --bookport is given.\n",
+	   DEFAULT_FIRMWARE, RC8650_SAMPLE_RATE, RC8650_SAMPLE_RATE);
 }
 
 /* --- WAV output ---------------------------------------------------------- */
@@ -219,7 +230,7 @@ main (int argc, char **argv)
 	order = atoi (argv[++i]), s16 = 1;
       else if (!strcmp (argv[i], "--bookport"))
 	{
-	  out_rate = 48000, dac_rate = 10486, lowpass = 3600, order = 1;
+	  out_rate = 48000, dac_rate = 10488, lowpass = 5000, order = 1;
 	  s16 = 1;
 	}
       else if (!strcmp (argv[i], "-q"))
