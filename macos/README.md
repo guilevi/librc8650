@@ -24,7 +24,8 @@ command protocol are the chip's own.
 
 ```
 ./build.sh              # build into build/
-./build.sh install      # build, install to /Applications, register
+./build.sh install      # build, stop the running app and extension, install
+                        # to /Applications, register, verify
 open /Applications/RC8650.app
 ```
 
