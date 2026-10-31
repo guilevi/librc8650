@@ -42,6 +42,15 @@
 // now gone.  (Matching the analysis bandwidth matters: with a fixed frame length
 // at both rates, the difference in resolution alone fakes a 2 dB tilt across the
 // consonant bands, which is a good way to spend an afternoon chasing nothing.)
+//
+// That is the default, `.smooth`.  The zero-order hold set aside above is now
+// offered as well, as `.staircase` and `.bookport`, because some hardware
+// really does sound like it: a BookPort's recording has the D/A's images in it
+// plainly, under a filter far gentler than the datasheet's.  Those two hold
+// each D/A sample for its whole period and average every output sample over
+// its own span — box integration, which is what a sample-and-hold measured at
+// 48 kHz looks like — then run the reconstruction filter.  The hold's own
+// sinc droop through 3-4.2 kHz is part of that sound, not a flaw in it.
 
 import Foundation
 
@@ -117,29 +126,71 @@ public struct OutputStage {
 
     /// Input samples consumed per output sample.
     private let step: Double
+    /// For a staircase: output samples each input sample is held for, or nil
+    /// for the smooth interpolator.
+    private let hold: Double?
+    /// How much of the output sample being built is filled, 0...1, and the
+    /// level x time accumulated in it.
+    private var holdFill: Double = 0
+    private var holdSum: Double = 0
+    private var gentle: OnePole?
     /// Where the next output sample falls, in input samples into `history`.
     private var position: Double
     /// Input history, with `taps` samples of run-up in front of `position`.
     private var history: [Float]
     private var filter: Biquad?
 
-    /// `cornerHz` of nil, or zero, leaves the reconstruction filter out.
+    /// `cornerHz` of nil, or zero, leaves the reconstruction filter out;
+    /// `.bookport` brings its own.
     public init(inputRate: Double = RC8650Chip.sampleRate,
                 outputRate: Double,
-                cornerHz: Int?) {
+                cornerHz: Int?,
+                resampling: RC8650Chip.Resampling = .smooth) {
+        let inputRate = resampling == .bookport ? RC8650Chip.bookportDACRate : inputRate
         self.inputRate = inputRate
         self.outputRate = outputRate
         step = inputRate / outputRate
+        hold = resampling == .smooth ? nil : outputRate / inputRate
         history = [Float](repeating: 0, count: Self.taps)
         position = Double(Self.taps)
-        if let cornerHz, cornerHz > 0 {
+        if resampling == .bookport {
+            gentle = OnePole(lowpassAt: Double(RC8650Chip.bookportCornerHz), rate: outputRate)
+        } else if let cornerHz, cornerHz > 0 {
             let corner = min(Double(cornerHz), outputRate * 0.45)
             filter = Biquad(lowpassAt: corner, rate: outputRate)
         }
     }
 
+    private mutating func output(_ x: Float, _ emit: (Float) -> Void) {
+        if gentle != nil {
+            emit(gentle!.process(x))
+        } else if filter != nil {
+            emit(filter!.process(x))
+        } else {
+            emit(x)
+        }
+    }
+
     public mutating func process(_ input: UnsafeBufferPointer<Int16>, emit: (Float) -> Void) {
         guard !input.isEmpty else { return }
+        if let hold {
+            for sample in input {
+                let level = Double(sample) / 32768
+                var left = hold
+                while left > 1e-9 {
+                    let take = min(1 - holdFill, left)
+                    holdSum += level * take
+                    holdFill += take
+                    left -= take
+                    if holdFill >= 1 - 1e-9 {
+                        output(Float(holdSum), emit)
+                        holdSum = 0
+                        holdFill = 0
+                    }
+                }
+            }
+            return
+        }
         history.reserveCapacity(history.count + input.count)
         for sample in input { history.append(Float(sample) / 32768) }
 
@@ -179,7 +230,9 @@ public struct OutputStage {
     /// Run the tail of the utterance out, so its last samples are not left
     /// inside the kernel or the filter's delay line.
     public mutating func flush(emit: (Float) -> Void) {
-        let pad = [Int16](repeating: 0, count: Self.taps + 1)
+        // A staircase has nothing in flight but the filter's own ring-down,
+        // which a few milliseconds of silence runs out.
+        let pad = [Int16](repeating: 0, count: hold == nil ? Self.taps + 1 : 64)
         pad.withUnsafeBufferPointer { process($0, emit: emit) }
     }
 }
@@ -207,6 +260,26 @@ struct Biquad {
         let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
         x2 = x1; x1 = x
         y2 = y1; y1 = y
+        return y
+    }
+}
+
+/// A first-order low-pass by the bilinear transform: one RC section, the
+/// gentlest filter an output stage is likely to have, and what a BookPort's
+/// recording fits best.
+struct OnePole {
+    private let b: Float, a1: Float
+    private var x1: Float = 0, y1: Float = 0
+
+    init(lowpassAt corner: Double, rate: Double) {
+        let k = tan(Double.pi * min(corner, rate * 0.45) / rate)
+        b = Float(k / (1 + k))
+        a1 = Float((k - 1) / (k + 1))
+    }
+
+    mutating func process(_ x: Float) -> Float {
+        let y = b * (x + x1) - a1 * y1
+        x1 = x; y1 = y
         return y
     }
 }

@@ -97,7 +97,16 @@ default is off.</td></tr>
 <tr><td>Output filter</td><td>—</td><td>Not a chip command: the reconstruction
 filter on the modeled output stage. The RC8650's audio pins are unfiltered, and
 the datasheet's own reference circuit is a 3 kHz low-pass — the default here.
-"Off" is the bare 10 kHz staircase the pins themselves put out.</td></tr>
+"Off" leaves the filter out.</td></tr>
+<tr><td>Resampling</td><td>—</td><td>Not a chip command either: how the
+chip's 10 kHz samples become your sound card's. "Smooth" interpolates between
+them and keeps nothing above 5 kHz. "D/A staircase" holds each sample the way
+the real D/A pin does, at 48 kHz, keeping the faint mirror images that adds
+above 5 kHz for the output filter to soften; with the filter off, that is the
+bare sound of the pins. "BookPort" is one real unit, measured from a recording:
+its chip runs about 5% fast, so it speaks a little higher and quicker, and its
+gentle 3.6 kHz filter leaves much of the images in. BookPort replaces the
+output filter setting. A change takes effect from the next thing spoken.</td></tr>
 </table>
 
 <h2>Known limitations</h2>

@@ -77,6 +77,9 @@ echo "some text" | rc8650say          # read stdin
 rc8650say --raw "hi" > raw.u8         # unsigned 8-bit PCM on stdout
 rc8650say -c 9S "Fast."               # send a command first (9S = fastest)
 rc8650say --chip-id                   # query the chip
+rc8650say --lowpass 3000 -o f.wav "Hi"   # 16-bit, through the output filter
+rc8650say --rate 48000 -o s.wav "Hi"  # 16-bit 48 kHz D/A staircase
+rc8650say --bookport -o b.wav "Hi"    # as a BookPort sounds (see below)
 ```
 
 The firmware image is found via `-f`, `$RC8650_FIRMWARE`, the working
@@ -191,6 +194,29 @@ product would have had: `rc8650_set_lowpass_hz()` sets its reconstruction
 filter, defaulting to the 3 kHz of the datasheet's own reference circuit
 (Figure 7). The AO pins really are unfiltered, so 0 — the raw 10 kHz
 sample-and-hold staircase, imaging hiss and all — is what they put out.
+
+How the samples are resampled is a choice too, because real products differ:
+
+| Mode | Calls | Sounds like |
+|---|---|---|
+| Smooth (default) | nothing | the 10 kHz stream, which whatever plays it interpolates; nothing above 5 kHz |
+| D/A staircase | `rc8650_set_output_rate(e, 48000)` | each sample held for a whole D/A period, so the mirror images of the speech either side of 10, 20, 30 kHz are there, under the low-pass |
+| BookPort | the above, plus `rc8650_set_dac_rate(e, 10486)`, `rc8650_set_lowpass_order(e, 1)`, `rc8650_set_lowpass_hz(e, 3600)` | one measured unit (below) |
+
+The BookPort figures come from a recording of an APH BookPort starting up.
+Its spectrum has the D/A's images in plain view between 6 and 10 kHz, and
+images plus a null at the D/A rate put that rate at about 10,486 Hz rather
+than 10,017: its chip runs about 4.7% fast, so it speaks that much higher and
+quicker. Its output filter fits a first-order low-pass at about 3.6 kHz to a
+median error of 0.7 dB, where the datasheet's second-order 3 kHz filter is off
+by 11.8 dB. Rendered with those settings, the emulator's band levels from 3 to
+20 kHz match the recording's within about 1 to 5 dB; the plain staircase under
+no filter is up to 16 dB too bright.
+
+`rc8650_samples_read` and index-marker positions stay in D/A samples whatever
+the output rate, so marker sync needs no change. The NVDA add-on offers these
+as its Resampling setting, and the Mac app on its Output tab (its own
+resampler, `OutputStage`, implements the same three).
 
 Rendering is pull-based: the CPU only advances as far as your audio demand,
 so a real-time callback can drive it directly, and a file writer can drain it

@@ -224,7 +224,15 @@ struct rc8650
   long ds_fill;			/* f1 cycles of the output sample filled so far */
   double ds_acc;		/* level x cycles in that output sample */
 
-  unsigned lowpass_hz;		/* 0 = bypass */
+  unsigned lowpass_hz;		/* 0 = bypass; the corner in use */
+  unsigned lowpass_req;		/* the corner asked for, before clamping */
+  unsigned lowpass_order;	/* 1 or 2 */
+  unsigned out_rate;		/* s16 path's rate; 0 = the D/A's own */
+  unsigned dac_rate;		/* D/A rate the staircase is held at */
+  double sc_acc;		/* staircase: level x time in this output sample */
+  double sc_fill;		/* staircase: how much of it is filled, 0..1 */
+  double sc_level;		/* staircase: the D/A sample being held */
+  double sc_left;		/* staircase: how much of its period is left */
   double b0, b1, b2, a1, a2;	/* biquad coefficients */
   double x1, x2, y1, y2;	/* biquad state */
 };
@@ -245,15 +253,22 @@ static void
 biquad_reset (rc8650_t *e)
 {
   e->x1 = e->x2 = e->y1 = e->y2 = 0.0;
+  e->sc_acc = e->sc_fill = e->sc_level = e->sc_left = 0.0;
 }
 
-/* Second-order Butterworth low-pass (RBJ cookbook, Q = 1/sqrt(2)) at the
- * D/A's own sample rate. */
+/* The low-pass at whichever rate the s16 path runs: a second-order
+ * Butterworth (RBJ cookbook, Q = 1/sqrt(2)) or a first-order one (bilinear
+ * one-pole), both from lowpass_req.  At the D/A's own rate the corner is
+ * clamped below its 5008 Hz Nyquist, as it always was; at a higher output rate
+ * it may go as far as 45% of that rate. */
 static void
 biquad_design (rc8650_t *e, unsigned hz)
 {
+  double rate = e->out_rate ? e->out_rate : RC8650_SAMPLE_RATE;
+  unsigned max = e->out_rate ? (unsigned) (0.45 * e->out_rate) : RC8650_MAX_LOWPASS_HZ;
   double w0, cw, sw, alpha, a0;
 
+  e->lowpass_req = hz;
   if (!hz)
     {
       e->lowpass_hz = 0;
@@ -262,30 +277,41 @@ biquad_design (rc8650_t *e, unsigned hz)
     }
   if (hz < 500)
     hz = 500;
-  if (hz > RC8650_MAX_LOWPASS_HZ)
-    hz = RC8650_MAX_LOWPASS_HZ;
+  if (hz > max)
+    hz = max;
 
-  w0 = 2.0 * 3.14159265358979323846 * hz / RC8650_SAMPLE_RATE;
-  cw = cos (w0);
-  sw = sin (w0);
-  alpha = sw / (2.0 * 0.70710678118654752440);
+  w0 = 2.0 * 3.14159265358979323846 * hz / rate;
+  if (e->lowpass_order == 1)
+    {
+      double k = tan (w0 / 2.0);
+      e->b0 = e->b1 = k / (1.0 + k);
+      e->b2 = 0.0;
+      e->a1 = (k - 1.0) / (k + 1.0);
+      e->a2 = 0.0;
+    }
+  else
+    {
+      cw = cos (w0);
+      sw = sin (w0);
+      alpha = sw / (2.0 * 0.70710678118654752440);
 
-  a0 = 1.0 + alpha;
-  e->b0 = ((1.0 - cw) / 2.0) / a0;
-  e->b1 = (1.0 - cw) / a0;
-  e->b2 = e->b0;
-  e->a1 = (-2.0 * cw) / a0;
-  e->a2 = (1.0 - alpha) / a0;
+      a0 = 1.0 + alpha;
+      e->b0 = ((1.0 - cw) / 2.0) / a0;
+      e->b1 = (1.0 - cw) / a0;
+      e->b2 = e->b0;
+      e->a1 = (-2.0 * cw) / a0;
+      e->a2 = (1.0 - alpha) / a0;
+    }
 
   e->lowpass_hz = hz;
   biquad_reset (e);
 }
 
-/* One raw D/A sample (unsigned, midscale 128) to a signed 16-bit sample. */
+/* A level (D/A units scaled to 16 bits, about zero) through the low-pass. */
 static int16_t
-out_sample (rc8650_t *e, unsigned char raw)
+filter_sample (rc8650_t *e, double x)
 {
-  double x = (raw - 128) * 256.0 * OUT_GAIN, y;
+  double y;
 
   if (e->lowpass_hz)
     {
@@ -306,11 +332,50 @@ out_sample (rc8650_t *e, unsigned char raw)
   return (int16_t) y;
 }
 
+/* One raw D/A sample (unsigned, midscale 128) to a signed 16-bit sample. */
+static int16_t
+out_sample (rc8650_t *e, unsigned char raw)
+{
+  return filter_sample (e, (raw - 128) * 256.0 * OUT_GAIN);
+}
+
 void
 rc8650_set_lowpass_hz (rc8650_t *e, unsigned hz)
 {
   if (e)
     biquad_design (e, hz);
+}
+
+void
+rc8650_set_lowpass_order (rc8650_t *e, unsigned order)
+{
+  if (!e)
+    return;
+  e->lowpass_order = order == 1 ? 1 : 2;
+  biquad_design (e, e->lowpass_req);
+}
+
+void
+rc8650_set_output_rate (rc8650_t *e, unsigned hz)
+{
+  if (!e)
+    return;
+  e->out_rate = hz ? (hz < 8000 ? 8000 : hz > 192000 ? 192000 : hz) : 0;
+  biquad_design (e, e->lowpass_req);
+}
+
+unsigned
+rc8650_get_output_rate (rc8650_t *e)
+{
+  return e && e->out_rate ? e->out_rate : RC8650_SAMPLE_RATE;
+}
+
+void
+rc8650_set_dac_rate (rc8650_t *e, unsigned hz)
+{
+  if (e)
+    e->dac_rate = hz ? (hz < 4000 ? 4000 : hz > 20000 ? 20000 : hz)
+      : RC8650_SAMPLE_RATE;
 }
 
 unsigned
@@ -1247,6 +1312,8 @@ rc8650_new_from_memory (const void *srec, size_t len, char **err)
       return NULL;
     }
   e->in_cap = IN_CAP;
+  e->lowpass_order = 2;
+  e->dac_rate = RC8650_SAMPLE_RATE;
   biquad_design (e, RC8650_DEFAULT_LOWPASS_HZ);
   rcdict_options_init (&e->dict, &rcdict_rc8650);
 
@@ -1722,12 +1789,86 @@ rc8650_read (rc8650_t *e, uint8_t *pcm, size_t max_samples, int *done)
   return n;
 }
 
+/* Spend what is left of the D/A sample being held on output samples, each
+   one the level averaged over its own span, until the sample runs out or the
+   buffer is full.  Returns the new fill of pcm. */
+static size_t
+stair_hold (rc8650_t *e, int16_t *pcm, size_t total, size_t max)
+{
+  while (e->sc_left > 0.0 && total < max)
+    {
+      double take = 1.0 - e->sc_fill;
+      if (take > e->sc_left)
+	take = e->sc_left;
+      e->sc_acc += e->sc_level * take;
+      e->sc_fill += take;
+      e->sc_left -= take;
+      if (e->sc_left < 1e-9)
+	e->sc_left = 0.0;
+      if (e->sc_fill >= 1.0 - 1e-9)
+	{
+	  pcm[total++] = filter_sample (e, e->sc_acc);
+	  e->sc_acc = 0.0;
+	  e->sc_fill = 0.0;
+	}
+    }
+  return total;
+}
+
 size_t
 rc8650_read_s16 (rc8650_t *e, int16_t *pcm, size_t max_samples, int *done)
 {
   uint8_t tmp[1024];
   size_t total = 0;
   int d = 0;
+
+  if (e && e->out_rate)
+    {
+      /* The D/A as it really is: a staircase, each sample held for one D/A
+	 period (out_rate / dac_rate output samples, rarely a whole number),
+	 and every output sample the level averaged over its own span - so the
+	 images either side of each multiple of the D/A rate come out at the
+	 strength the sample-and-hold gives them, under the low-pass, instead
+	 of being removed by whatever resamples the 10 kHz stream later.
+
+	 Only as many D/A samples are pulled as are sure to fit, so none is
+	 read and then lost; the one sample a buffer shorter than a D/A period
+	 cannot take whole is held over in sc_level/sc_left.  The short-read
+	 rule below still holds. */
+      double per = (double) e->out_rate / e->dac_rate;
+
+      while (total < max_samples)
+	{
+	  size_t want, n, i;
+
+	  /* Finish the sample being held first: a buffer smaller than one D/A
+	     period leaves the rest of it here for the next call. */
+	  total = stair_hold (e, pcm, total, max_samples);
+	  if (total >= max_samples)
+	    break;
+
+	  /* As many D/A samples as are sure to fit, at least one. */
+	  want = (size_t) ((max_samples - total + 1 - e->sc_fill) / per);
+	  if (want > 1)
+	    want--;
+	  if (want == 0)
+	    want = 1;
+	  if (want > sizeof tmp)
+	    want = sizeof tmp;
+	  n = rc8650_read (e, tmp, want, &d);
+	  for (i = 0; i < n; i++)
+	    {
+	      e->sc_level = (tmp[i] - 128) * 256.0 * OUT_GAIN;
+	      e->sc_left = per;
+	      total = stair_hold (e, pcm, total, max_samples);
+	    }
+	  if (n < want)
+	    break;
+	}
+      if (done)
+	*done = d && total == 0;
+      return total;
+    }
 
   /* tmp is a conversion window, not a buffering policy: this loop exists to
      convert in slices, and must not turn rc8650_read's short read back into a

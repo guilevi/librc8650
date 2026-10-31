@@ -47,7 +47,8 @@ final class LocalPlayer: @unchecked Sendable {
                 node.play()
 
                 var stage = OutputStage(outputRate: Self.sampleRate,
-                                        cornerHz: parameters.lowpassHz)
+                                        cornerHz: parameters.lowpassHz,
+                                        resampling: parameters.resampling)
                 var frames = 0
                 var pending = [Float]()
                 pending.reserveCapacity(4096)

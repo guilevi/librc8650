@@ -252,6 +252,38 @@ public enum RC8650Chip {
     public static let lowpassOff = 0
     public static let lowpassDefault = 3000
 
+    /// How the D/A's samples become the output's.  See OutputStage.
+    public enum Resampling: String, Codable, CaseIterable, Hashable, Sendable {
+        /// Bandlimited interpolation: what the chip's samples sound like
+        /// through the system's own converter, with nothing above 5 kHz.
+        case smooth
+        /// The sample-and-hold staircase the D/A pin really puts out, its
+        /// images either side of every multiple of the D/A rate kept, then
+        /// the reconstruction filter.
+        case staircase
+        /// One real unit, measured from a recording of a BookPort starting
+        /// up: the staircase at a D/A rate of about 10,486 Hz, under a gentle
+        /// first-order 3.6 kHz filter that leaves much of the images in.
+        /// Replaces the reconstruction filter setting.
+        case bookport
+
+        public var name: String {
+            switch self {
+            case .smooth: return "Smooth — 10 kHz, no D/A images"
+            case .staircase: return "D/A staircase — images kept"
+            case .bookport: return "BookPort — 10.49 kHz D/A, gentle 3.6 kHz filter"
+            }
+        }
+    }
+
+    /// The BookPort's output stage, fitted to its recording: D/A images
+    /// and a null at the D/A rate put that at 10,486 Hz, about 4.7% above
+    /// the nominal rate, so it speaks that much higher and faster; and a
+    /// first-order low-pass at 3.6 kHz fits its spectrum to a median 0.7 dB
+    /// where the datasheet's second-order 3 kHz one is off by 11.8 dB.
+    public static let bookportDACRate = 10486.0
+    public static let bookportCornerHz = 3600
+
     // MARK: - Building the command stream
 
     /// The command prefix for one utterance, given a full set of parameters.
@@ -446,6 +478,9 @@ public struct Parameters: Codable, Hashable, Sendable {
     /// that turning it back on restores the setting rather than a default.
     public var lowpassCornerHz: Int = RC8650Chip.lowpassDefault
 
+    /// How the D/A's samples reach the output.
+    public var resampling: RC8650Chip.Resampling = .smooth
+
     /// What the library is actually given.
     public var lowpassHz: Int {
         lowpassEnabled ? lowpassCornerHz.clamped(to: RC8650Chip.lowpassRange) : RC8650Chip.lowpassOff
@@ -487,6 +522,7 @@ public struct Parameters: Codable, Hashable, Sendable {
         timeout = get(.timeout, d.timeout)
         lowpassEnabled = get(.lowpassEnabled, d.lowpassEnabled)
         lowpassCornerHz = get(.lowpassCornerHz, d.lowpassCornerHz)
+        resampling = get(.resampling, d.resampling)
     }
 
     /// The assembled Punctuation Filter Register.  Note the two inversions the

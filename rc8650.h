@@ -172,6 +172,34 @@ size_t rc8650_read_s16 (rc8650_t *e, int16_t *pcm, size_t max_samples,
 void rc8650_set_lowpass_hz (rc8650_t *e, unsigned hz);
 unsigned rc8650_get_lowpass_hz (rc8650_t *e);
 
+/* The low-pass's order: 2 (the default, a Butterworth biquad) or 1 (a gentle
+ * one-pole).  Real products differ: an APH BookPort measured as the D/A's
+ * staircase under roughly a first-order 3.6 kHz filter, images and all. */
+void rc8650_set_lowpass_order (rc8650_t *e, unsigned order);
+
+/* Run the s16 path at hz instead of the D/A's own rate.  0, the default, keeps
+ * it at RC8650_SAMPLE_RATE, exactly as it has always been.  Any other rate
+ * (8000..192000; 48000 is the natural choice) renders the D/A as the
+ * staircase it is: each sample held for one D/A period and every output
+ * sample averaged over its span, so the images around each multiple of the
+ * D/A rate are there at the strength a sample-and-hold gives them, then the
+ * low-pass above, designed at hz (its corner may then go up to 45% of hz).
+ * At 10 kHz those images cannot exist, so this is the only way to hear a
+ * product that leaves them in.
+ *
+ * Index markers and rc8650_samples_read stay in D/A samples, so a caller that
+ * syncs markers against them needs no change.  rc8650_get_output_rate says
+ * what rate rc8650_read_s16 is delivering. */
+void rc8650_set_output_rate (rc8650_t *e, unsigned hz);
+unsigned rc8650_get_output_rate (rc8650_t *e);
+
+/* The D/A rate the staircase is held at, for rc8650_set_output_rate's path:
+ * RC8650_SAMPLE_RATE unless the product ran its chip from a different clock.
+ * The BookPort recording's images sit around 10,486 Hz, not 10,017: its chip
+ * runs about 4.7% fast, which raises pitch and formants and shortens speech by
+ * the same proportion.  4000..20000; 0 restores the default. */
+void rc8650_set_dac_rate (rc8650_t *e, unsigned hz);
+
 /* Bytes the chip has sent back on its serial port: replies to query commands
  * such as 6? and 12?, and programming result codes.  Returns bytes copied.
  *

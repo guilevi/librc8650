@@ -188,6 +188,15 @@ class _Rc8650DLL:
 		lib.rc8650_set_lowpass_hz.argtypes = [ctypes.c_void_p, ctypes.c_uint]
 		lib.rc8650_sample_rate.restype = ctypes.c_uint
 		lib.rc8650_sample_rate.argtypes = []
+		# How rc8650_read_s16 resamples (see _resamplings). Absent from DLLs
+		# built before they existed, which then offer only the smooth stage.
+		try:
+			for name in ("rc8650_set_output_rate", "rc8650_set_dac_rate",
+					"rc8650_set_lowpass_order"):
+				getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_uint]
+			self.hasStaircase = True
+		except AttributeError:
+			self.hasStaircase = False
 		lib.rc8650_version.restype = ctypes.c_char_p
 		lib.rc8650_version.argtypes = []
 		lib.rc8650_get_profile.restype = ctypes.c_int
@@ -349,6 +358,10 @@ class SynthDriver(SynthDriver):
 			# command). See _filters.
 			DriverSetting("filter", "Output &filter",
 				availableInSettingsRing=True, defaultVal="3000"),
+			# How the D/A's samples become the sound card's (not a chip
+			# command either). See _resamplings.
+			DriverSetting("resampling", "Re&sampling",
+				availableInSettingsRing=True, defaultVal="smooth"),
 		)
 
 	def _get_supportedSettings(self):
@@ -431,15 +444,45 @@ class SynthDriver(SynthDriver):
 	# (Figure 7, "Low Cost 3 kHz Low-Pass Filter/Power Amplifier") - what a
 	# finished RC8650 product sounded like. "Off" is the bare D/A: the
 	# unfiltered 10 kHz sample-and-hold staircase, complete with its imaging
-	# hiss, which is what the AO pins themselves put out. 4800 is the ceiling
+	# hiss, which is what the AO pins themselves put out - when Resampling is
+	# a staircase; the smooth resampling has already removed the images, so
+	# there "Off" is merely bright. 4800 is the ceiling
 	# the library allows, below the 5008 Hz Nyquist frequency.
 	_filters = {
-		"0": StringParameterInfo("0", "Off (unfiltered D/A)"),
+		"0": StringParameterInfo("0", "Off (no output filter)"),
 		"2000": StringParameterInfo("2000", "Muffled (2 kHz)"),
 		"2500": StringParameterInfo("2500", "Warm (2.5 kHz)"),
 		"3000": StringParameterInfo("3000", "Datasheet (3 kHz)"),
 		"3800": StringParameterInfo("3800", "Bright (3.8 kHz)"),
 		"4800": StringParameterInfo("4800", "Widest (4.8 kHz)"),
+	}
+
+	# How the chip's D/A samples reach the sound card.
+	#
+	# "smooth" is how this driver always worked: the 10 kHz stream goes out as
+	# it is and Windows resamples it, which interpolates between samples and
+	# throws away everything above 5 kHz - the images a real D/A puts there
+	# included.
+	#
+	# A real D/A holds each sample until the next: a staircase, whose steps
+	# put mirror images of the speech either side of every multiple of the
+	# sample rate, for the output filter to soften (the datasheet's 3 kHz
+	# filter leaves them faintly audible) or not. "staircase" renders exactly
+	# that at 48 kHz, then applies the output filter chosen above.
+	#
+	# "bookport" is one particular unit, measured from a recording of a
+	# BookPort starting up: its D/A runs at about 10,486 Hz rather than the
+	# nominal 10,017 - so it speaks about 5% higher and faster - and its
+	# output filter is a gentle first-order one at about 3.6 kHz, which
+	# leaves much of the images in. That is the "hissy", slightly brighter
+	# BookPort sound. It overrides the output filter setting.
+	OUTPUT_RATE = 48000
+	_resamplings = {
+		"smooth": StringParameterInfo("smooth", "Smooth (10 kHz, no D/A images)"),
+		"staircase": StringParameterInfo("staircase",
+			"D/A staircase (48 kHz, images kept)"),
+		"bookport": StringParameterInfo("bookport",
+			"BookPort (staircase, 10.49 kHz D/A, gentle 3.6 kHz filter)"),
 	}
 
 	@classmethod
@@ -506,17 +549,23 @@ class SynthDriver(SynthDriver):
 			outputDevice = config.conf["audio"]["outputDevice"]
 		except KeyError:
 			outputDevice = config.conf["speech"]["outputDevice"]
-		self._player = nvwave.WavePlayer(
-			channels=1,
-			samplesPerSec=int(self._rc.sample_rate),
-			bitsPerSample=16,
-			outputDevice=outputDevice,
-		)
+		self._outputDevice = outputDevice
+		# The player is replaced when the resampling changes its rate, and
+		# only by the synthesis thread, between utterances; this lock covers
+		# the main thread's stop() and pause() against the swap.
+		self._playerLock = threading.Lock()
+		self._playerRate = int(self._rc.sample_rate)
+		self._player = self._newPlayer(self._playerRate)
 		self._rate = self._RATE_DEFAULT
 		self._pitch = 50
 		self._volume = 60  # -> nV 5, the card default
 		self._voice = "0"
 		self._filter = "3000"
+		self._resampling = "smooth"
+		# Set when the filter or resampling changes; the synthesis thread
+		# applies it before the next utterance, so one utterance never comes
+		# out half at one rate and half at another.
+		self._stageDirty = False
 		self._punctuation = "2"
 		self._numbers = True
 		self._leadingzeros = True
@@ -554,7 +603,38 @@ class SynthDriver(SynthDriver):
 		self._thread = threading.Thread(target=self._synthLoop, daemon=True)
 		self._thread.start()
 		with self._libLock:
-			self._rc.lib.rc8650_set_lowpass_hz(self._rc.handle, int(self._filter))
+			self._applyOutputStage()
+
+	def _newPlayer(self, rate):
+		return nvwave.WavePlayer(
+			channels=1,
+			samplesPerSec=rate,
+			bitsPerSample=16,
+			outputDevice=self._outputDevice,
+		)
+
+	def _stage(self):
+		"""(output rate, D/A rate, filter corner, filter order) for the
+		current settings; output rate 0 is the chip's own 10 kHz."""
+		if not self._rc.hasStaircase or self._resampling == "smooth":
+			return 0, 0, int(self._filter), 2
+		if self._resampling == "bookport":
+			return self.OUTPUT_RATE, 10486, 3600, 1
+		return self.OUTPUT_RATE, 0, int(self._filter), 2
+
+	def _applyOutputStage(self):
+		"""Hand the output stage to the library. Call with _libLock held.
+		Returns the rate rc8650_read_s16 now produces."""
+		lib, h = self._rc.lib, self._rc.handle
+		outRate, dacRate, corner, order = self._stage()
+		if self._rc.hasStaircase:
+			lib.rc8650_set_lowpass_order(h, order)
+			lib.rc8650_set_output_rate(h, outRate)
+			lib.rc8650_set_dac_rate(h, dacRate)
+		# After the rate: the filter is designed for the rate it runs at.
+		lib.rc8650_set_lowpass_hz(h, corner)
+		self._stageDirty = False
+		return outRate or int(self._rc.sample_rate)
 
 	def terminate(self):
 		self.cancel()
@@ -852,8 +932,21 @@ class SynthDriver(SynthDriver):
 		if value not in self._filters:
 			return
 		self._filter = value
-		with self._libLock:
-			self._rc.lib.rc8650_set_lowpass_hz(self._rc.handle, int(value))
+		self._stageDirty = True
+
+	def _get_availableResamplings(self):
+		if not self._rc.hasStaircase:
+			return {"smooth": self._resamplings["smooth"]}
+		return self._resamplings
+
+	def _get_resampling(self):
+		return self._resampling
+
+	def _set_resampling(self, value):
+		if value not in self._get_availableResamplings():
+			return
+		self._resampling = value
+		self._stageDirty = True
 
 	# --- unit conversion -----------------------------------------------------
 
@@ -1128,10 +1221,12 @@ class SynthDriver(SynthDriver):
 		# Nothing to undo for the indexes NVDA has just abandoned: an
 		# utterance's markers belong to its queue item, which the generation
 		# bump above has already written off.
-		self._player.stop()
+		with self._playerLock:
+			self._player.stop()
 
 	def pause(self, switch):
-		self._player.pause(switch)
+		with self._playerLock:
+			self._player.pause(switch)
 
 	# --- synthesis thread ----------------------------------------------------
 
@@ -1140,8 +1235,11 @@ class SynthDriver(SynthDriver):
 		h = self._rc.handle
 		# 16-bit samples: a c_char buffer of 2 bytes each, cast to int16* for
 		# the call; buf.raw[:n*2] is then the little-endian PCM to feed.
-		buf = ctypes.create_string_buffer(SAMPLES_PER_CHUNK * 2)
+		# Room for a chunk's worth of audio at the highest output rate.
+		capacity = SAMPLES_PER_CHUNK * (self.OUTPUT_RATE // 10000 + 1)
+		buf = ctypes.create_string_buffer(capacity * 2)
 		buf16 = ctypes.cast(buf, ctypes.POINTER(ctypes.c_int16))
+		chunk = SAMPLES_PER_CHUNK
 		done = ctypes.c_int(0)
 		marks = (_Rc8650IndexMark * MARKERS_PER_READ)()
 		while True:
@@ -1154,6 +1252,20 @@ class SynthDriver(SynthDriver):
 					# Cancelled between NVDA queueing it and this thread
 					# picking it up.
 					continue
+				if self._stageDirty:
+					with self._libLock:
+						rate = self._applyOutputStage()
+					# The same span of speech per read at any rate.
+					chunk = min(capacity,
+						SAMPLES_PER_CHUNK * rate // int(self._rc.sample_rate))
+					if rate != self._playerRate:
+						# Between utterances, so nothing queued is lost: the
+						# last one ended in idle() or a cancel's stop().
+						player = self._newPlayer(rate)
+						with self._playerLock:
+							old, self._player = self._player, player
+							self._playerRate = rate
+						old.close()
 				# Markers the chip has sent back whose audio has not been fed
 				# to the player yet: (sample position, marker number).
 				pending = []
@@ -1180,7 +1292,7 @@ class SynthDriver(SynthDriver):
 						lib.rc8650_write(h, b"\x00", 1)
 					while gen == self._generation:
 						with self._libLock:
-							n = lib.rc8650_read_s16(h, buf16, SAMPLES_PER_CHUNK,
+							n = lib.rc8650_read_s16(h, buf16, chunk,
 								ctypes.byref(done))
 							raw = buf.raw[:n * 2] if n else b""
 							# Both of these belong to the read that just ran, so

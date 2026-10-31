@@ -43,6 +43,7 @@ public final class SpeechStream: @unchecked Sendable {
     public func start(parameters: Parameters, items: [SpeechItem]) {
         let render = Self.renderItems(parameters: parameters, items: items)
         let lowpass = parameters.lowpassHz
+        let resampling = parameters.resampling
         guard !render.isEmpty else {
             producerDone.value = true
             return
@@ -50,7 +51,7 @@ public final class SpeechStream: @unchecked Sendable {
 
         let thread = Thread { [weak self] in
             guard let self else { return }
-            self.produce(items: render, lowpassHz: lowpass)
+            self.produce(items: render, lowpassHz: lowpass, resampling: resampling)
         }
         thread.name = "RC8650 render"
         // Above the default but below a real-time thread: this feeds audio, so
@@ -93,12 +94,14 @@ public final class SpeechStream: @unchecked Sendable {
         return out
     }
 
-    private func produce(items: [RC8650Engine.Item], lowpassHz: Int) {
+    private func produce(items: [RC8650Engine.Item], lowpassHz: Int,
+                         resampling: RC8650Chip.Resampling) {
         // The chip's bare D/A, then the staircase, then the reconstruction
         // filter — see OutputStage for why that order matters and what the
         // previous one cost.
         var stage = OutputStage(outputRate: outputSampleRate,
-                                cornerHz: lowpassHz)
+                                cornerHz: lowpassHz,
+                                resampling: resampling)
         var pending = [Float]()
         pending.reserveCapacity(4096)
 

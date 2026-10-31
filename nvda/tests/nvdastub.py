@@ -69,6 +69,8 @@ def install(configPath):
 
 		def __init__(self, **kwargs):
 			self.fed = bytearray()
+			self.samplesPerSec = kwargs.get("samplesPerSec")
+			self.closed = False
 
 		def feed(self, data, onDone=None):
 			self.fed.extend(data)
@@ -82,7 +84,7 @@ def install(configPath):
 			pass
 
 		def close(self):
-			pass
+			self.closed = True
 
 		def pause(self, switch):
 			pass

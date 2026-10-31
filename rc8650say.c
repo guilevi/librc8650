@@ -73,20 +73,20 @@ put_u16 (FILE *f, unsigned v)
 /* Canonical 8-bit mono PCM header.  Written with a placeholder length and
  * patched once the size is known, so we never have to buffer the audio. */
 static void
-wav_header (FILE *f, unsigned long nsamples)
+wav_header (FILE *f, unsigned long nsamples, unsigned rate, unsigned bytes)
 {
   fwrite ("RIFF", 1, 4, f);
-  put_u32 (f, 36 + nsamples);
+  put_u32 (f, 36 + nsamples * bytes + (nsamples * bytes & 1));
   fwrite ("WAVEfmt ", 1, 8, f);
   put_u32 (f, 16);
   put_u16 (f, 1);		/* PCM */
   put_u16 (f, 1);		/* mono */
-  put_u32 (f, RC8650_SAMPLE_RATE);
-  put_u32 (f, RC8650_SAMPLE_RATE);	/* byte rate = rate * 1 * 1 */
-  put_u16 (f, 1);		/* block align */
-  put_u16 (f, 8);		/* bits per sample */
+  put_u32 (f, rate);
+  put_u32 (f, rate * bytes);	/* byte rate */
+  put_u16 (f, bytes);		/* block align */
+  put_u16 (f, 8 * bytes);	/* bits per sample */
   fwrite ("data", 1, 4, f);
-  put_u32 (f, nsamples);
+  put_u32 (f, nsamples * bytes);
 }
 
 /* --- firmware discovery -------------------------------------------------- */
@@ -162,6 +162,10 @@ main (int argc, char **argv)
   int ndicts = 0, nprecmds = 0, inline_phonemes = 0;
   rcdict *dict = NULL;
   int raw = 0, chip_id = 0, quiet = 0;
+  int s16 = 0, order = 0;
+  long out_rate = -1, dac_rate = -1, lowpass = -1;
+  unsigned rate = RC8650_SAMPLE_RATE, bytes = 1;
+  int16_t pcm[4096];
   char text[8192];
   size_t textlen = 0;
   char *err = NULL;
@@ -205,6 +209,19 @@ main (int argc, char **argv)
 	raw = 1;
       else if (!strcmp (argv[i], "--chip-id"))
 	chip_id = 1;
+      else if (!strcmp (argv[i], "--rate") && i + 1 < argc)
+	out_rate = atol (argv[++i]), s16 = 1;
+      else if (!strcmp (argv[i], "--dac-rate") && i + 1 < argc)
+	dac_rate = atol (argv[++i]);
+      else if (!strcmp (argv[i], "--lowpass") && i + 1 < argc)
+	lowpass = atol (argv[++i]), s16 = 1;
+      else if (!strcmp (argv[i], "--order") && i + 1 < argc)
+	order = atoi (argv[++i]), s16 = 1;
+      else if (!strcmp (argv[i], "--bookport"))
+	{
+	  out_rate = 48000, dac_rate = 10486, lowpass = 3600, order = 1;
+	  s16 = 1;
+	}
       else if (!strcmp (argv[i], "-q"))
 	quiet = 1;
       else if (argv[i][0] == '-' && argv[i][1] && !out_path)
@@ -303,8 +320,22 @@ main (int argc, char **argv)
       playing = 1;
     }
 
+  if (s16)
+    {
+      if (order)
+	rc8650_set_lowpass_order (e, (unsigned) order);
+      if (out_rate >= 0)
+	rc8650_set_output_rate (e, (unsigned) out_rate);
+      if (dac_rate >= 0)
+	rc8650_set_dac_rate (e, (unsigned) dac_rate);
+      if (lowpass >= 0)
+	rc8650_set_lowpass_hz (e, (unsigned) lowpass);
+      rate = rc8650_get_output_rate (e);
+      bytes = 2;
+    }
+
   if (!raw)
-    wav_header (out, 0);	/* patched below */
+    wav_header (out, 0, rate, bytes);	/* patched below */
 
   if (ndicts || inline_phonemes)
     {
@@ -321,28 +352,41 @@ main (int argc, char **argv)
   if (!quiet && !raw)
     fprintf (stderr, "rc8650say: synthesizing...\r");
 
-  while ((n = rc8650_read (e, buf, sizeof buf, &done)) > 0)
+  for (;;)
     {
-      fwrite (buf, 1, n, out);
+      if (s16)
+	{
+	  size_t k;
+	  n = rc8650_read_s16 (e, pcm, sizeof pcm / sizeof pcm[0], &done);
+	  for (k = 0; k < n; k++)	/* little-endian whatever the host */
+	    put_u16 (out, (uint16_t) pcm[k]);
+	}
+      else
+	{
+	  n = rc8650_read (e, buf, sizeof buf, &done);
+	  fwrite (buf, 1, n, out);
+	}
+      if (n == 0)
+	break;
       total += n;
       if (!quiet && !raw)
 	fprintf (stderr, "rc8650say: synthesizing... %.2fs\r",
-		 (double) total / RC8650_SAMPLE_RATE);
+		 (double) total / rate);
     }
 
   if (!raw)
     {
-      if (total & 1)		/* RIFF chunks are word aligned */
+      if (total * bytes & 1)	/* RIFF chunks are word aligned */
 	fputc (0, out);
       fseek (out, 0, SEEK_SET);
-      wav_header (out, total);
+      wav_header (out, total, rate, bytes);
     }
   if (out != stdout)
     fclose (out);
 
   if (!quiet && !raw)
-    fprintf (stderr, "rc8650say: %.2f s of audio (%lu samples at %d Hz)\n",
-	     (double) total / RC8650_SAMPLE_RATE, total, RC8650_SAMPLE_RATE);
+    fprintf (stderr, "rc8650say: %.2f s of audio (%lu samples at %u Hz)\n",
+	     (double) total / rate, total, rate);
 
   rc8650_free (e);
   rcdict_free (dict);

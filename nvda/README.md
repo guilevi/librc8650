@@ -105,6 +105,7 @@ untouched voice sounds exactly like the firmware intends.
 | Speak leading zeros | `nB` bit 3 | on/off | no |
 | Four-digit numbers as years | `nB` bit 4 | on/off | no |
 | Output filter | — (host side) | off, 2–4.8 kHz | no |
+| Resampling | — (host side) | smooth / D/A staircase / BookPort | no |
 
 NVDA's speech indexes are the chip's index markers (`nI`) — see below.
 

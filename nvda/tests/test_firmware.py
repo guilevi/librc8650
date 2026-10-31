@@ -144,6 +144,34 @@ def one(driverDir, dylib, image):
 	check("%s: all %d voices sound different" % (name, len(voices)),
 		not same, "identical audio: %r" % same)
 
+	# Each resampling: the player follows the output rate, and every D/A
+	# sample becomes output_rate / D/A rate output samples - the nominal
+	# rate for the staircase, a BookPort's faster one for that. Measured
+	# against the chip's own sample count, since the same sentence twice
+	# need not come out the same length.
+	ratios = {}
+	driver._player.fed.clear()
+	lib, h = driver._rc.lib, driver._rc.handle
+	for mode, rate, dac in (("staircase", 48000, 10017), ("bookport", 48000, 10486),
+			("smooth", 10017, 10017)):
+		driver._set_resampling(mode)
+		before = len(done.notified)
+		startDac = lib.rc8650_samples_read(h)
+		driver.speak(["One two three."])
+		deadline = time.time() + 60
+		while len(done.notified) == before and time.time() < deadline:
+			time.sleep(0.05)
+		player = driver._player
+		dacSamples = lib.rc8650_samples_read(h) - startDac
+		out = len(player.fed) // 2
+		player.fed.clear()
+		ratios[mode] = out / float(max(dacSamples, 1))
+		check("%s: %s resampling plays at %d Hz, %.4f samples per D/A sample"
+			% (name, mode, rate, ratios[mode]),
+			player.samplesPerSec == rate and dacSamples > 5000
+			and abs(ratios[mode] / (rate / float(dac)) - 1) < 0.002,
+			"%r Hz, %d D/A samples, %d out" % (player.samplesPerSec, dacSamples, out))
+
 	driver.adoptFirmwareDefaults()
 	check("%s: adoptFirmwareDefaults starts from the voice's preset" % name,
 		driver._formant == driver._voicePresets[driver._voice][2]

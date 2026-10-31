@@ -24,13 +24,37 @@ struct OutputTab: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                Text("Resampling")
+                    .font(.headline)
+
+                Picker("Resampling", selection: $model.parameters.resampling) {
+                    ForEach(RC8650Chip.Resampling.allCases, id: \.self) { mode in
+                        Text(mode.name).tag(mode)
+                    }
+                }
+                Text("""
+                     Smooth interpolates between the chip's samples and keeps nothing \
+                     above 5 kHz. The D/A staircase holds each sample the way the D/A \
+                     pin does, keeping the mirror images that puts above 5 kHz for the \
+                     filter below to soften. BookPort is one measured unit: its D/A runs \
+                     about 5% fast, so it speaks a little higher and quicker, and its \
+                     gentle filter leaves much of the images in. BookPort replaces the \
+                     filter settings below.
+                     """)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+
                 Text("Reconstruction filter")
                     .font(.headline)
 
                 Toggle("Filter the output", isOn: $model.parameters.lowpassEnabled)
+                    .disabled(model.parameters.resampling == .bookport)
                 Text("""
-                     Off is the bare D/A: the unfiltered 10 kHz sample-and-hold staircase \
-                     the AO pins themselves put out, imaging hiss and all. The corner \
+                     Off with the D/A staircase is the bare D/A: what the AO pins \
+                     themselves put out, imaging hiss and all. With smooth resampling the \
+                     images are already gone, so off is merely brighter. The corner \
                      frequency below is kept while it is off, so switching back on \
                      restores it.
                      """)
@@ -47,7 +71,7 @@ struct OutputTab: View {
                         Text("Custom — \(corner.wrappedValue) Hz").tag(corner.wrappedValue)
                     }
                 }
-                .disabled(!model.parameters.lowpassEnabled)
+                .disabled(!model.parameters.lowpassEnabled || model.parameters.resampling == .bookport)
 
                 IntSliderRow(
                     title: "Corner frequency",
@@ -55,11 +79,13 @@ struct OutputTab: View {
                     range: RC8650Chip.lowpassRange,
                     caption: "500 to 4800 Hz. The chip puts nothing above its own 5008 Hz Nyquist frequency, so the top of this range is barely distinguishable from switching the filter off — which is what the switch above is for.",
                     display: { "\($0) Hz" })
-                    .disabled(!model.parameters.lowpassEnabled)
+                    .disabled(!model.parameters.lowpassEnabled || model.parameters.resampling == .bookport)
 
                 LabeledContent("In effect") {
-                    Text(model.parameters.lowpassHz == 0
-                         ? "off — unfiltered D/A"
+                    Text(model.parameters.resampling == .bookport
+                         ? "BookPort — \(RC8650Chip.bookportCornerHz) Hz first-order low-pass"
+                         : model.parameters.lowpassHz == 0
+                         ? "off"
                          : "\(model.parameters.lowpassHz) Hz low-pass")
                         .foregroundStyle(.secondary)
                 }
@@ -69,10 +95,11 @@ struct OutputTab: View {
                 Text("Sample rate")
                     .font(.headline)
                 Text("""
-                     The D/A runs at \(Int(RC8650Chip.sampleRate)) Hz — the 7.3728 MHz crystal \
-                     divided by 8 (timer B2's f8 source) and by the timer's reload of 92. \
-                     Both this app and the speech extension take the chip's bare samples \
-                     and interpolate them up to the output rate, then run the filter above. \
+                     The D/A runs at about \(Int(RC8650Chip.sampleRate)) Hz, paced by the \
+                     firmware's timer A3 from the 7.3728 MHz clock; the formant setting \
+                     moves it. Both this app and the speech extension take the chip's \
+                     bare samples and resample them to the output rate as chosen above, \
+                     then run the filter. \
                      They use the same code at the same rate, so Speak and Speak Through \
                      macOS are the same signal.
                      """)
@@ -80,7 +107,7 @@ struct OutputTab: View {
                     .foregroundStyle(.secondary)
 
                 Text("""
-                     The interpolation is a windowed sinc, matched against what \
+                     Smooth resampling is a windowed sinc, matched against what \
                      `rc8650say` sounds like played through afplay — which is the same \
                      bare D/A samples reconstructed by the system's own converter. A \
                      smoothing interpolator would take nearly 40% out of the 3 to 4.2 kHz \
