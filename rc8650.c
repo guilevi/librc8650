@@ -131,13 +131,43 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
    dictionary-hostile names), and is never mistaken for idle.  Playback can
    spin in as few as 4, but it writes the D/A as it does.
 
+   That count is not enough on its own.  A lone CTRL+X, a command with no
+   text after it (CTRL+A 0O) and CTRL+A 95J CR leave the chip in a loop of
+   about 158 PCs, and other idle windows reach 196, too close to busy work's
+   quietest 215 for any count to separate them.  Those inputs are not
+   finished: the firmware is waiting for more bytes - a CR, or J's parameter
+   bytes, of which the CR was only the first - and on a real unit that waiting
+   costs nobody anything.  Here it held rc8650_read for the whole THINK_CAP.
+   "The same PCs as the window before" separates them better, but not well
+   enough: after a reset and a run of commands the chip works through its
+   input buffer in a 231-PC loop that repeats its set for several windows
+   before it speaks.
+
+   So the firmware is asked instead.  Its input buffer (0x0872-0x1033 on the
+   RC8650) is a read and a write pointer; dispatch handler 5, the code the
+   idle loop itself calls to decide there is nothing to do, returns write
+   minus read, with the read pointer at 0x08[sb], or at 0x0A[sb] while bit 2
+   of 0x47[sb] is set, and the write pointer at 0x0E[sb].  Busy work always
+   has something in that buffer, and it always either moves those pointers or
+   moves through new code.  Across ~780 busy windows with no output on each
+   chip (fresh boot, warm, after a cancel, after a reset and commands with no
+   reads between; four prefix orders; long words, hostile names, numbers,
+   symbols, markers, inline phonemes) not one had an empty buffer, and not one
+   had still pointers and the previous window's PC set.  Of ~62,000 idle
+   windows per chip all but six pass one test or the other.
+
    So: a window of IDLE_WINDOW instructions in which no input was taken and no
-   sample produced, TS low, DMA stopped, nothing left in the input ring and the
-   CPU confined to at most IDLE_PCS distinct PCs is an idle window, and
-   IDLE_RUNS of them in a row end the work - 32k instructions, about 4 ms of
-   host time, after the chip went idle.  PCs are counted through a 1024-bucket
-   hash, which can only undercount; the threshold sits at twice the idle count
-   and less than half the lowest busy one. */
+   sample produced, with TS low, DMA stopped and nothing left in the input
+   ring, is idle if the CPU stayed within IDLE_PCS distinct PCs, or if the
+   firmware's input buffer is empty, or if its pointers did not move and the
+   CPU visited the same PCs as in the window before.  IDLE_RUNS of them in a
+   row end the work - 32k instructions, about 4 ms of host time.  PCs go into a
+   1024-bucket hash set, which can only undercount distinct PCs and merge sets
+   that differ; everything above was measured through the same hash.
+
+   The handler is found at boot by its bytes, the same in all six firmware
+   sets, and its SB (0x123E on every RC8650 build, 0x29CE on the RC8660) is
+   read the first time it runs.  Until then only the PC count applies. */
 #define IDLE_WINDOW     16384UL
 #define IDLE_PCS          100
 #define IDLE_RUNS           2
@@ -233,8 +263,12 @@ struct rc8650
   /* The idle rule in step_and_track: the PCs seen this window, as a 1024-bit
    * hash set, how many, how far through the window, and how many idle
    * windows in a row. */
-  unsigned char pcset[128];
+  unsigned char pcset[128], pcset_prev[128];
   unsigned pc_distinct;
+  unsigned long h5_pc;		/* dispatch handler 5, 0 if not found */
+  unsigned in_sb;		/* its SB, 0 until it has run */
+  unsigned in_ptr[3];		/* its pointers at the window's start */
+  int ptr_moved;
   unsigned long pc_steps;
   int idle_runs;
 
@@ -1306,6 +1340,24 @@ boot (rc8650_t *e, char **err)
   e->booted = 1;
   e->profiled = 0;
 
+  /* Dispatch handler 5 - the firmware's input-buffer occupancy - for the idle
+   * rule; see IDLE_WINDOW. */
+  {
+    static const unsigned char h5[] = { 0x73, 0xa0, 0x08, 0x5a, 0x47, 0x6a,
+      0x04, 0x73, 0xa0, 0x0a, 0xa9, 0xa0, 0x0e, 0x75, 0x50, 0xf3 };
+    unsigned long a;
+    size_t k;
+    e->h5_pc = 0;
+    e->in_sb = 0;
+    for (a = 0xa0000; a < 0xfc000 && !e->h5_pc; a++)
+      {
+	for (k = 0; k < sizeof h5 && mem_get_qi (a + k) == h5[k]; k++)
+	  ;
+	if (k == sizeof h5)
+	  e->h5_pc = a;
+      }
+  }
+
   /* Firmware header byte 7 is the family (notes.md section 3), and the
    * families differ in more than the name: the RC8660 numbers its index
    * markers to 255. */
@@ -1700,6 +1752,16 @@ step (rc8650_t *e)
   e->thinking++;
 }
 
+/* The firmware's input-buffer pointers - read, alternate read, write - for
+ * the idle rule; see IDLE_WINDOW.  Plain RAM, so reading has no effect. */
+static void
+input_pointers (rc8650_t *e, unsigned out[3])
+{
+  out[0] = mem_get_hi (e->in_sb + 0x08);
+  out[1] = mem_get_hi (e->in_sb + 0x0a);
+  out[2] = mem_get_hi (e->in_sb + 0x0e);
+}
+
 /* Advance one instruction and re-evaluate whether the chip still owes us
  * anything.  Work finishes either when playback has run and then stopped, or
  * when the chip swallowed the input without ever starting to speak (a query
@@ -1805,9 +1867,39 @@ step_and_track (rc8650_t *e)
 	e->pcset[h >> 3] |= 1 << (h & 7);
 	e->pc_distinct++;
       }
+    if (!e->in_sb && e->h5_pc && (p & 0xfffff) == e->h5_pc)
+      {
+	e->in_sb = get_reg (sb);
+	input_pointers (e, e->in_ptr);
+	e->ptr_moved = 1;	/* this window started before we could look */
+      }
+    if (e->in_sb && (e->pc_steps & 255) == 255)
+      {
+	unsigned now[3];
+	input_pointers (e, now);
+	if (memcmp (now, e->in_ptr, sizeof now))
+	  e->ptr_moved = 1;
+      }
     if (++e->pc_steps >= IDLE_WINDOW)
       {
-	if (e->pc_distinct <= IDLE_PCS && e->thinking >= IDLE_WINDOW
+	unsigned now[3];
+	int looping = e->pc_distinct <= IDLE_PCS;
+	if (e->in_sb)
+	  {
+	    input_pointers (e, now);
+	    if (memcmp (now, e->in_ptr, sizeof now))
+	      e->ptr_moved = 1;
+	    /* Handler 5's own sum: write minus whichever read pointer bit 2
+	       of 0x47[sb] selects. */
+	    if (now[2] == ((mem_get_qi (e->in_sb + 0x47) & 4) ? now[1] : now[0]))
+	      looping = 1;
+	    else if (!e->ptr_moved
+		     && !memcmp (e->pcset, e->pcset_prev, sizeof e->pcset))
+	      looping = 1;
+	    memcpy (e->in_ptr, now, sizeof now);
+	    e->ptr_moved = 0;
+	  }
+	if (looping && e->thinking >= IDLE_WINDOW
 	    && e->since_sample >= IDLE_WINDOW && RING_EMPTY (e, in)
 	    && !talk_status () && !dma_active ())
 	  {
@@ -1816,6 +1908,7 @@ step_and_track (rc8650_t *e)
 	  }
 	else
 	  e->idle_runs = 0;
+	memcpy (e->pcset_prev, e->pcset, sizeof e->pcset);
 	memset (e->pcset, 0, sizeof e->pcset);
 	e->pc_distinct = 0;
 	e->pc_steps = 0;
