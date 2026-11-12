@@ -49,12 +49,12 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
  * and dictionary lookup), and QUIET_INSNS is how much silence with the DMA
  * stopped counts as end-of-utterance.
  *
- * THINK_CAP is also what bounds the one case where the chip never answers at
- * all: text it decides not to speak.  Feed it a bare CR or a single space and
- * no D/A write ever happens, so the pump runs the full budget before
- * concluding there is nothing to say - the caller sees that as a dead stop.
- * The old 400M made that a 38-second freeze, which for a screen reader
- * driving this library is worse than any wrong answer.
+ * THINK_CAP used to be what ended text the chip decides not to speak - a
+ * bare CR, a single space, a lone quote or slash - and the caller saw the
+ * full budget as a dead stop: 38 seconds at the old 400M, still about a
+ * second at 8M.  The idle rule (IDLE_WINDOW) now ends those within a few
+ * thousand instructions of the chip going idle, so THINK_CAP is only the
+ * backstop for a chip that is neither speaking nor idle.
  *
  * 8M is measured, not guessed.  Time-to-first-sample was sampled across the
  * inputs most likely to make the translator work: dictionary-hostile proper
@@ -109,6 +109,38 @@ extern int trace, verbose, enable_counting, m32c_p6_driven;
    for the single letter "a").  Under it, THINK_CAP is the backstop, which is
    what covers text the chip declines to speak. */
 #define HEARD_ENOUGH      512UL
+
+/* Telling "the chip has nothing to say" from "the chip is still thinking"
+   without waiting out THINK_CAP.
+
+   Input the chip says nothing for - a lone space, an index marker or prosody
+   command on its own, and in the default punctuation mode any of ' " / [ ] _
+   ` { } ~ - never raises TS.  The chip plays 153 samples of silence through
+   DMA and goes idle within ~34k instructions.  None of the end-of-utterance
+   rules can act on that (TS never rose, and 153 is under HEARD_ENOUGH), so
+   until this rule existed only THINK_CAP ended it: 8M instructions, about a
+   second of host time, with the caller blocked in rc8650_read - and for the
+   NVDA driver, a cancel blocked behind it on the library lock.
+
+   What the chip does when it is idle can be seen in what the CPU executes.
+   The background loop and the timer interrupt that re-enters it visit exactly
+   50 distinct PCs in every 16k-instruction window, on the RC8650 and the
+   RC8660 alike.  Letter-to-sound work with nothing coming out visits 228-920
+   (measured across a long hostile word, the voice-before-nG ordering whose
+   opening burst comes before up to 149k instructions of parsing, and
+   dictionary-hostile names), and is never mistaken for idle.  Playback can
+   spin in as few as 4, but it writes the D/A as it does.
+
+   So: a window of IDLE_WINDOW instructions in which no input was taken and no
+   sample produced, TS low, DMA stopped, nothing left in the input ring and the
+   CPU confined to at most IDLE_PCS distinct PCs is an idle window, and
+   IDLE_RUNS of them in a row end the work - 32k instructions, about 4 ms of
+   host time, after the chip went idle.  PCs are counted through a 1024-bucket
+   hash, which can only undercount; the threshold sits at twice the idle count
+   and less than half the lowest busy one. */
+#define IDLE_WINDOW     16384UL
+#define IDLE_PCS          100
+#define IDLE_RUNS           2
 
 /* The D/A runs at whatever rate the firmware programs into timer A3, which is
    not one rate: the formant setting (nF) moves it between about 9.1 and
@@ -197,6 +229,14 @@ struct rc8650
   int started;			/* TS has been seen asserted for this work */
   int dma_seen;			/* DMA0 has run for this work */
   unsigned long heard;		/* samples produced for this work */
+
+  /* The idle rule in step_and_track: the PCs seen this window, as a 1024-bit
+   * hash set, how many, how far through the window, and how many idle
+   * windows in a row. */
+  unsigned char pcset[128];
+  unsigned pc_distinct;
+  unsigned long pc_steps;
+  int idle_runs;
 
   /* The firmware's own writes to its flash (the 255W greeting): which 8 KB
    * units of the 0x80000 window they touched, and those units' contents.
@@ -1460,6 +1500,7 @@ rc8650_write (rc8650_t *e, const void *data, size_t len)
   e->work = 1;
   e->started = e->heard = e->dma_seen = 0;
   e->thinking = 0;
+  e->idle_runs = 0;
 }
 
 /* --- pronunciation dictionary ---------------------------------------------
@@ -1583,6 +1624,7 @@ deliver_stop (rc8650_t *e)
 
   e->work = e->started = e->talking = e->heard = e->dma_seen = 0;
   e->since_sample = e->thinking = 0;
+  e->idle_runs = 0;
   /* The audio being dropped here was counted as produced, and the markers
      pointing into it are now meaningless.  Drop them and close the gap, so
      samples_read stays a position in the same stream that later markers are
@@ -1753,6 +1795,32 @@ step_and_track (rc8650_t *e)
       e->work = 0;
       return;
     }
+
+  /* The chip is idle: see IDLE_WINDOW. */
+  {
+    unsigned p = get_reg (pc);
+    unsigned h = (p ^ (p >> 10)) & 1023;
+    if (!(e->pcset[h >> 3] & (1 << (h & 7))))
+      {
+	e->pcset[h >> 3] |= 1 << (h & 7);
+	e->pc_distinct++;
+      }
+    if (++e->pc_steps >= IDLE_WINDOW)
+      {
+	if (e->pc_distinct <= IDLE_PCS && e->thinking >= IDLE_WINDOW
+	    && e->since_sample >= IDLE_WINDOW && RING_EMPTY (e, in)
+	    && !talk_status () && !dma_active ())
+	  {
+	    if (++e->idle_runs >= IDLE_RUNS)
+	      e->work = 0;
+	  }
+	else
+	  e->idle_runs = 0;
+	memset (e->pcset, 0, sizeof e->pcset);
+	e->pc_distinct = 0;
+	e->pc_steps = 0;
+      }
+  }
 
   /* Nothing out and nothing taken in for THINK_CAP: the chip has finished
      with this work, or will not finish it.  This must not wait for the input
