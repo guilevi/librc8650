@@ -294,6 +294,12 @@ immediately by the Reload button.
 
 ## Testing
 
+    python3 tests/test_import.py synthDrivers/rc8650
+
+This import regression check needs neither a DLL nor firmware. The NVDA stub
+models automatic property creation, including rejection of a class that defines
+both `_get_supportedSettings` and an explicit `supportedSettings` property.
+
     make -C .. shared      # the tests load librc8650.dylib in place of the DLL
     tests/run.sh
 
@@ -329,5 +335,8 @@ than on the driver: with one shared map, a number handed out again while its
 first owner is still playing resolves to the wrong index, and NVDA acts on
 these — a wrong index in Say All jumps the reading to the wrong place.
 
-It has **not** yet been run inside NVDA itself; `lastTestedNVDAVersion` is set
-so it installs on current versions, not because it has been through them.
+Live smoke tests on 64-bit NVDA 2026.3rc1 and 32-bit NVDA 2025.1.2 with
+RC8650 v2.60 model 4 verified
+synthesizer enumeration, driver loading, settings and voice enumeration, speech
+completion and an index notification. This does not establish full live
+acceptance on every version allowed by the manifest.

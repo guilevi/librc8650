@@ -14,6 +14,9 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+echo "== driver import and settings descriptors"
+python3 test_import.py ../synthDrivers/rc8650
+
 LIB=${LIB:-}
 if [[ -z "$LIB" ]]; then
     for candidate in ../../librc8650.dylib ../../librc8650.so; do

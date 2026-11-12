@@ -8,6 +8,27 @@ import sys
 import types
 
 
+class _AutoPropertyType(type):
+	"""Model NVDA's descriptor creation, including duplicate declarations.
+
+	A plain object base misses import errors caused by defining both _get_x
+	and x in the same driver class. Caching and abstract properties are not
+	needed by these tests.
+	"""
+
+	def __init__(cls, name, bases, namespace):
+		super().__init__(name, bases, namespace)
+		properties = {key[5:] for key in namespace
+			if key.startswith(("_get_", "_set_", "_del_"))}
+		for name in properties:
+			if name in namespace:
+				raise TypeError("%s is already a class attribute" % name)
+			getter = getattr(cls, "_get_" + name, None)
+			setter = namespace.get("_set_" + name)
+			deleter = namespace.get("_del_" + name)
+			setattr(cls, name, property(getter, setter, deleter))
+
+
 def install(configPath):
 	# The drivers import FreeLibrary to unmap the DLL on terminate. It only
 	# exists on Windows; here the library is never unmapped, which is exactly
@@ -119,7 +140,7 @@ def install(configPath):
 
 	sdh = types.ModuleType("synthDriverHandler")
 
-	class SynthDriver(object):
+	class SynthDriver(metaclass=_AutoPropertyType):
 		@staticmethod
 		def VoiceSetting(**kwargs):
 			return _Setting("voice", "Voice", **kwargs)
