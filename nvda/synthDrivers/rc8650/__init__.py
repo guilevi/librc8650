@@ -365,9 +365,8 @@ class SynthDriver(SynthDriver):
 		)
 
 	def _get_supportedSettings(self):
+		# NVDA's AutoPropertyType creates supportedSettings from this getter.
 		return self._settings
-
-	supportedSettings = property(_get_supportedSettings)
 
 	supportedCommands = {IndexCommand, PitchCommand, RateCommand, VolumeCommand}
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
