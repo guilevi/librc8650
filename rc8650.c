@@ -32,6 +32,7 @@ extern void init_regs (void);
 extern void m32c_rc865x_reset (void);
 extern int m32c_baremetal, m32c_rc865x, m32c_p8_or, m32c_p7_or;
 extern int m32c_extflash_armed;
+extern unsigned long long m32c_extflash_dirty;
 extern int (*rc865x_hook_rx) (unsigned char *);
 extern void (*rc865x_hook_tx) (unsigned char);
 extern void (*rc865x_hook_dac) (unsigned char);
@@ -196,6 +197,12 @@ struct rc8650
   int started;			/* TS has been seen asserted for this work */
   int dma_seen;			/* DMA0 has run for this work */
   unsigned long heard;		/* samples produced for this work */
+
+  /* The firmware's own writes to its flash (the 255W greeting): which 8 KB
+   * units of the 0x80000 window they touched, and those units' contents.
+   * They are the chip's nonvolatile memory, so a reset must not lose them. */
+  unsigned long long nv_mask;
+  unsigned char *nv;		/* 0x80000 bytes once anything is written */
   int booted;
 
   int status_msgs;		/* caller has enabled STM; trust Table 3 */
@@ -1191,8 +1198,25 @@ static int
 boot (rc8650_t *e, char **err)
 {
   unsigned int reset;
+  int i;
 
   m32c_set_cpu (CPU_M16C);	/* the -m m16c mode of the standalone sim */
+
+  /* What the firmware wrote to its flash survives the reset, as it does on
+   * the chip: save it before memory is wiped, put it back over the image. */
+  if (e->booted && m32c_extflash_dirty)
+    {
+      if (!e->nv)
+	e->nv = malloc (0x80000);
+      if (e->nv)
+	{
+	  for (i = 0; i < 64; i++)
+	    if (m32c_extflash_dirty & (1ULL << i))
+	      mem_get_blk (0x80000 + i * 0x2000, e->nv + i * 0x2000, 0x2000);
+	  e->nv_mask |= m32c_extflash_dirty;
+	}
+    }
+  m32c_extflash_dirty = 0;
 
   /* A cold boot, every time.  Memory, registers and the peripheral models all
    * outlive a reload of the image, and the firmware relies on power-on state:
@@ -1224,6 +1248,10 @@ boot (rc8650_t *e, char **err)
       set_err (err, "firmware image contains no usable S-records");
       return -1;
     }
+  for (i = 0; i < 64; i++)
+    if (e->nv_mask & (1ULL << i))
+      mem_put_blk (0x80000 + i * 0x2000, e->nv + i * 0x2000, 0x2000);
+  m32c_extflash_dirty = e->nv_mask;
   m32c_extflash_armed = 1;	/* flash writes are command cycles from now on */
 
   /* Start where the reset vector points, exactly as the S-record path in the
@@ -1401,6 +1429,7 @@ rc8650_free (rc8650_t *e)
   free (e->in);
   free (e->image_srec);
   free (e->image);
+  free (e->nv);
   free (e);
 }
 

@@ -182,10 +182,11 @@
  }
 --- a/sim/m32c/mem.c
 +++ b/sim/m32c/mem.c
-@@ -43,6 +43,243 @@
+@@ -42,7 +42,248 @@
+ #include "int.h"
  #include "timer_a.h"
  #endif
- 
++
 +/* --- RC8650/RC8660 board support (see notes.md) ---------------------------
 +   The firmware is bare metal and uses 0x0000e1 and 0x000400-0x000403 as
 +   ordinary RAM, but the simulator reserves them as hosted-newlib hooks; 0x403
@@ -247,8 +248,12 @@
 +   simulator memory.  M32C_EXTFLASH_ID=<hex4> overrides the id.  */
 +int m32c_extflash_id = 0x370e;
 +int m32c_extflash_armed = 0;	/* set by main() once the image is loaded */
++/* Which 8 KB units of the window the firmware has erased or programmed: bit n
++   covers 0x80000 + n * 0x2000.  The library uses it to carry the chip's
++   nonvolatile data - the 255W greeting - across a reload of the image. */
++unsigned long long m32c_extflash_dirty = 0;
 +int m32c_cpi = 4;		/* timer cycles charged per instruction */
-+static int extflash_state = 0, extflash_idmode = 0;
++static int extflash_state = 0, extflash_idmode = 0, extflash_prog_hi = -1;
 +FILE *m32c_dac_file = NULL;	/* DA0 (0x3d8) write tap */
 +unsigned long m32c_pcsample = 0;	/* print the PC every n instructions */
 +unsigned long m32c_statedump = 0;	/* dump key RAM every n instructions */
@@ -392,7 +397,7 @@
 +      dar = raw24 (base + 4);
 +      tcr = *mem_ptr (base + 8) | (*mem_ptr (base + 9) << 8);
 +      step = (con & 0x01) ? 1 : 2;
-+
+ 
 +      m32c_dma_write = 1;
 +      mem_put_qi (dar, *mem_ptr (sar & membus_mask));
 +      if (step == 2)
@@ -426,7 +431,119 @@
  #define L1_BITS  (10)
  #define L2_BITS  (10)
  #define OFF_BITS (12)
-@@ -213,15 +450,49 @@
+@@ -205,7 +446,111 @@
+ 
+ extern int m32c_disassemble;
+ 
++/* The external flash: an AMD-command-set NOR part on the 16-bit bus.  Only
++   the bank the window shows at power-up is modelled - the one holding the
++   firmware and BIOS, selected by P7.3-5 and P8.3 all high - because that is
++   where the firmware keeps its own nonvolatile data (the 255W greeting is
++   erased and programmed at 0x7F8000).  The recording memory in the other banks
++   is still not emulated: commands sent while another bank is switched in are
++   ignored.
++
++   Erase and program complete at once, so DQ7 data polling - all the RAM
++   helper copied from 0x0FEF2F does - sees the final value on its first read.
++   Programming can only clear bits, as on the part.  Sector erase clears 8 KB
++   inside the top 64 KB (the boot sectors of a top-boot part: the greeting
++   sector sits two below the BIOS, and a 64 KB erase there would take the BIOS
++   with it) and 64 KB elsewhere.  Chip erase is ignored rather than let it
++   take the firmware.  */
++static int
++extflash_default_bank (void)
++{
++  return (*mem_ptr (0x3ed) & 0x38) == 0x38 && (*mem_ptr (0x3f0) & 0x08);
++}
++
+ static void
++extflash_erase (int address)
++{
++  int size = address >= 0xf0000 ? 0x2000 : 0x10000;
++  int lo = address & ~(size - 1), a;
++  for (a = lo; a < lo + size; a++)
++    *mem_ptr (a) = 0xff;
++  for (a = lo; a < lo + size; a += 0x2000)
++    m32c_extflash_dirty |= 1ULL << ((a - 0x80000) >> 13);
++}
++
++static void
++extflash_program (int address, unsigned char value, unsigned char *m)
++{
++  if (!extflash_default_bank ())
++    return;
++  *m &= value;
++  m32c_extflash_dirty |= 1ULL << ((address - 0x80000) >> 13);
++}
++
++static void
++extflash_write (int address, unsigned char value, unsigned char *m)
++{
++  /* The odd half of a word program: ste.w arrives as two byte stores. */
++  if (extflash_prog_hi >= 0)
++    {
++      int expect = extflash_prog_hi;
++      extflash_prog_hi = -1;
++      if (address == expect)
++	{
++	  extflash_program (address, value, m);
++	  return;
++	}
++    }
++
++  if (extflash_state == 3)	/* after AA 55 A0, this store is the data */
++    {
++      extflash_state = 0;
++      extflash_program (address, value, m);
++      if (!(address & 1))
++	extflash_prog_hi = address + 1;
++      return;
++    }
++
++  if (value == 0xf0)		/* reset to read array */
++    {
++      extflash_idmode = extflash_state = 0;
++      return;
++    }
++
++  /* States 0-2 and 4-6 are the two unlock cycles before the first and the
++     second command byte; 3 is "program armed".  */
++  switch (extflash_state)
++    {
++    case 0:
++    case 4:
++      extflash_state = (value == 0xaa && (address & 0xfff) == 0xaaa)
++	? extflash_state + 1 : 0;
++      break;
++    case 1:
++    case 5:
++      extflash_state = (value == 0x55 && (address & 0xfff) == 0x554)
++	? extflash_state + 1 : 0;
++      break;
++    case 2:
++      extflash_state = 0;
++      if ((address & 0xfff) != 0xaaa)
++	break;
++      if (value == 0x90)
++	extflash_idmode = 1;
++      else if (value == 0xa0)
++	extflash_state = 3;
++      else if (value == 0x80)
++	extflash_state = 4;
++      break;
++    case 6:
++      extflash_state = 0;
++      if (value == 0x30 && extflash_default_bank ())
++	extflash_erase (address);
++      break;			/* 0x10, chip erase: deliberately ignored */
++    }
++}
++
++static void
+ mem_put_byte (int address, unsigned char value)
+ {
+   unsigned char *m;
+@@ -213,15 +558,31 @@
    m = mem_ptr (address);
    if (trace)
      printf (" %02x", value);
@@ -440,26 +557,8 @@
 +
 +  if (m32c_rc865x && m32c_extflash_armed && address >= 0x80000)
 +    {
-+      if (value == 0xf0)	/* reset to read array */
-+	extflash_idmode = extflash_state = 0;
-+      else
-+	switch (extflash_state)
-+	  {
-+	  case 0:
-+	    if (value == 0xaa && (address & 0xfff) == 0xaaa)
-+	      extflash_state = 1;
-+	    break;
-+	  case 1:
-+	    extflash_state =
-+	      (value == 0x55 && (address & 0xfff) == 0x554) ? 2 : 0;
-+	    break;
-+	  case 2:
-+	    extflash_state = 0;
-+	    if (value == 0x90 && (address & 0xfff) == 0xaaa)
-+	      extflash_idmode = 1;
-+	    break;
-+	  }
-+      return;			/* command cycle, never a store */
++      extflash_write (address, value, m);
++      return;			/* a command cycle, never a plain store */
 +    }
 +
    *m = value;
@@ -477,7 +576,7 @@
  	int i;
  	if (old_led != value)
  	  {
-@@ -301,21 +572,106 @@
+@@ -301,21 +662,106 @@
        break;
  
      case 0x400:
@@ -589,7 +688,7 @@
  }
  
  void
-@@ -330,7 +686,7 @@
+@@ -330,7 +776,7 @@
  void
  mem_put_hi (int address, unsigned short value)
  {
@@ -598,10 +697,11 @@
      {
        printf ("SimTrace: %06lx %04x\n", regs.r_pc, value);
        return;
-@@ -414,12 +770,122 @@
+@@ -413,13 +859,123 @@
+   console_raw = 0;
  }
  #endif
- 
++
 +/* stdin_ready() stays true at EOF, which fed the firmware an endless stream
 +   of NULs and drove it into its error state.  Read one byte ahead instead and
 +   only assert RI when a byte was genuinely received.  */
@@ -655,7 +755,7 @@
 +   re-fires between vectoring and the U0RB read and a phantom 0x00 lands in
 +   the receive ring.  */
 +static int rx_pending = 0;	/* byte presented in U0RB, not yet read */
-+
+ 
 +/* Returns 0: nothing to present; 1: byte already pending; 2: newly arrived */
 +static int
 +rc865x_rx_present (void)
@@ -721,7 +821,7 @@
    switch (address)
      {
  #ifdef HAVE_TERMIOS_H
-@@ -618,3 +1084,244 @@
+@@ -618,3 +1174,245 @@
      }
  }
  #endif
@@ -959,6 +1059,7 @@
 +  memset (&timer_a3, 0, sizeof timer_a3);
 +  memset (dma_init, 0, sizeof dma_init);
 +  extflash_state = extflash_idmode = 0;
++  extflash_prog_hi = -1;
 +  rx_have = rx_eof = rx_pending = 0;
 +  m32c_p6_driven = 0;
 +  m32c_f1_clock = 0;
@@ -1577,14 +1678,15 @@
  
    dc = decode_cr (reg);
    sc = decode_srcdest4 (srcx,1);
-@@ -850,7 +959,12 @@
+@@ -849,8 +958,13 @@
+   /** 0111 1100 1111 0000  LDCTX abs16,abs20 */
  
    NOTYET();
- 
++
 +  /* LDE sets S and Z from the transferred value (M16C software manual);
 +     the RC865x BIOS relies on it -- its flash-id table search ends with
 +     "lde.w table[a0],r0 ; jeq done".  */
-+
+ 
    /** 0111 010w 1000 dest  LDE.size abs20,dest */
 +  CYC_RM (4, 5);
  
@@ -2096,7 +2198,7 @@
    while (count)
      {
        if (w)
-@@ -1411,12 +1605,15 @@
+@@ -1411,11 +1605,14 @@
    }
  
    /** 0111 110w 1110 1010  SSTR.size */
@@ -2106,12 +2208,11 @@
    int count = get_reg (r3);
    int s1 = get_reg (a1);
    v = get_reg (w ? r0 : r0l);
- 
-+  CYC_EXTRA (2 * count);
 +
++  CYC_EXTRA (2 * count);
+ 
    while (count)
      {
-       if (w)
 @@ -1436,12 +1633,14 @@
    }
  
