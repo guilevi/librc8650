@@ -45,7 +45,7 @@ shopt -u nullglob
 # with the synthesizer, and a settings category cannot - so it is a second
 # directory in the package and easy to leave out of these lines.
 rm -f rc8650.nvda-addon
-EXCLUDES=(-x "*/__pycache__/*")
+EXCLUDES=(-x "*/__pycache__/*" -x "*.DS_Store")
 if [[ $WITH_FW == 1 ]]; then
     [[ ${#FW[@]} -gt 0 ]] || { echo "no firmware image to bundle" >&2; exit 1; }
     zip -r -q rc8650.nvda-addon manifest.ini synthDrivers globalPlugins doc "${EXCLUDES[@]}"

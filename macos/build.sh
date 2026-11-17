@@ -95,6 +95,19 @@ if [ "$ACTION" = install ] || [ "${INSTALL:-}" = 1 ]; then
 	pluginkit -r "$APP/Contents/PlugIns/RC8650Voices.appex" 2>/dev/null || true
 	"$LSREGISTER" -u "$APP" 2>/dev/null || true
 
+	# Builds from before the rename to com.guilevi are a different extension
+	# as far as the system is concerned, and while one is registered its
+	# voices - com.rcsystems.rc8650.voice.N - can shadow ours in the system
+	# voice list.  A system voice setting pointing at one of them falls back
+	# to the default voice.
+	pluginkit -m -A -D -v -i com.rcsystems.rc8650.voices |
+		awk -F'\t' 'NF > 1 { print $NF }' | sort -u |
+		while IFS= read -r old; do
+			echo "unregistering an old build: $old"
+			pluginkit -r "$old" 2>/dev/null || true
+			"$LSREGISTER" -u "${old%/Contents/PlugIns/*}" 2>/dev/null || true
+		done
+
 	# LaunchServices is what registers the extension inside the app; it does
 	# that when it sees the app, which a copy into /Applications is enough for,
 	# but asking directly makes it immediate.

@@ -34,3 +34,6 @@ rcdict/build/
 # project xcodegen generates from project.yml.
 macos/lib/
 macos/RC8650.xcodeproj/
+
+# Release assets
+dist/

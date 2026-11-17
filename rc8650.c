@@ -2221,5 +2221,5 @@ rc8650_sample_rate (void)
 const char *
 rc8650_version (void)
 {
-  return "librc8650 0.1 (RC8650 firmware on an emulated Renesas M16C)";
+  return "librc8650 0.4.0 (RC8650 firmware on an emulated Renesas M16C)";
 }
